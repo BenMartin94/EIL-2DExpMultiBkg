@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 
 from Unet import UNet
 import main as data_main
+from MultiBkgDataset import MultiBkgDataset
 
 
 class FieldsDataset(Dataset):
@@ -53,9 +54,37 @@ class LitUNet(pl.LightningModule):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
+    
+    def reconstruction(self, fg_sct, bg_sct, bg_grid):
+        """Reconstruct the full fg_grid from fg_sct-bg_sct and bg_grid
+        by adding the background field back into the predicted contrast for each bg
+
+        """
+        # fg_sct: (B,2,24,24)
+        # bg_sct: (B,nbkgs,2,24,24)
+        # bg_grid: (B,nbkgs,2,100,100)
+        B, nbkgs, _, H, W = bg_sct.shape
+        fg_sct_expanded = fg_sct.unsqueeze(1).expand(-1, nbkgs, -1, -1, -1)  # (B,nbkgs,2,24,24)
+        contrast = fg_sct_expanded - bg_sct  # (B,nbkgs,2,24,24)
+        contrast_reshaped = contrast.view(B * nbkgs, 2, H, W)
+        pred_contrast_grid = self(contrast_reshaped)  # (B*nbkgs,2,100,100)
+        pred_contrast_grid = pred_contrast_grid.view(B, nbkgs, 2, 100, 100)
+        # Reconstruct fg_grid by adding bg_grid back
+        # fg_grid = pred_contrast_grid * bg_grid + bg_grid
+        # first convert pred_contrast_grid and bg_grid to complex to handle complex arithmetic correctly
+        # Note: For channels-first format (B,nbkgs,2,H,W), real is channel 0, imag is channel 1
+        pred_contrast_complex = pred_contrast_grid[:, :, 0] + 1j * pred_contrast_grid[:, :, 1]
+        bg_grid_complex = bg_grid[:, :, 0] + 1j * bg_grid[:, :, 1]
+        fg_grid_complex = pred_contrast_complex * bg_grid_complex + bg_grid_complex
+        # Convert back to channels-first format with torch.stack
+        fg_grid = torch.stack([fg_grid_complex.real, fg_grid_complex.imag], dim=2)  # (B,nbkgs,2,100,100)
+        fg_grid_mu = fg_grid.mean(dim=1)  # (B,2,100,100)
+        fg_grid_deviation = torch.std(fg_grid, dim=1)  # (B,2,100,100)
+        return fg_grid, fg_grid_mu, fg_grid_deviation
+
 
     def training_step(self, batch, batch_idx: int):
-        x, y = batch
+        x, y, fg_grid, bg_grid, fg_sct_field, bg_sct_field = batch
         y_hat = self(x)
         loss = self.criterion(y_hat, y)
         
@@ -84,7 +113,19 @@ class LitUNet(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx: int):
-        x, y = batch
+        x, y, fg_grid, bg_grid, fg_sct_field, bg_sct_field = batch
+
+        # Get all backgrounds from the dataset for proper reconstruction evaluation
+        dataset = self.trainer.val_dataloaders.dataset
+        if hasattr(dataset, 'dataset'):  # Handle case where it's wrapped in a Subset
+            dataset = dataset.dataset
+        all_bg_grids, all_bg_fields = dataset.get_backgrounds()
+        
+        # Move to device
+        all_bg_grids = all_bg_grids.to(self.device)
+        all_bg_fields = all_bg_fields.to(self.device)
+        
+        
         y_hat = self(x)
         val_loss = self.criterion(y_hat, y)
         
@@ -106,16 +147,37 @@ class LitUNet(pl.LightningModule):
         # Log images to TensorBoard every 5 epochs
         if batch_idx == 0 and (self.current_epoch + 1) % 5 == 0:
             self._log_images_to_tensorboard(x, y, y_hat)
+            self._log_reconstruction_images(fg_grid, all_bg_grids, fg_sct_field, all_bg_fields)
             
         # Log weight histograms every 10 epochs
         if batch_idx == 0 and (self.current_epoch + 1) % 10 == 0:
             self._log_weight_histograms()
             
         return val_loss
+        
     
     def _log_images_to_tensorboard(self, x, y, y_hat):
         """Log sample images to TensorBoard"""
         n_examples = min(4, x.size(0))
+        
+        def normalize_for_tensorboard(tensor):
+            """Normalize tensor to [0, 1] range for TensorBoard visualization"""
+            # Work with the original tensor shape
+            original_shape = tensor.shape
+            batch_size = original_shape[0]
+            
+            # Flatten each image in the batch individually
+            tensor_flat = tensor.view(batch_size, -1)
+            tensor_min = tensor_flat.min(dim=1, keepdim=True)[0]
+            tensor_max = tensor_flat.max(dim=1, keepdim=True)[0]
+            tensor_range = tensor_max - tensor_min
+            
+            # Avoid division by zero
+            tensor_range = torch.where(tensor_range == 0, torch.ones_like(tensor_range), tensor_range)
+            
+            # Normalize and reshape back to original shape
+            tensor_flat_norm = (tensor_flat - tensor_min) / tensor_range
+            return tensor_flat_norm.view(original_shape)
         
         # Create image grids for TensorBoard
         input_images = []
@@ -133,16 +195,21 @@ class LitUNet(pl.LightningModule):
         target_grid = torch.stack(target_images)
         pred_grid = torch.stack(pred_images)
         
+        # Normalize all grids
+        input_grid_norm = normalize_for_tensorboard(input_grid)
+        target_grid_norm = normalize_for_tensorboard(target_grid)
+        pred_grid_norm = normalize_for_tensorboard(pred_grid)
+        
         # Log to TensorBoard
         if self.logger and hasattr(self.logger, 'experiment'):
             self.logger.experiment.add_images(
-                'validation/input_real', input_grid, self.current_epoch
+                'validation/input_real', input_grid_norm, self.current_epoch
             )
             self.logger.experiment.add_images(
-                'validation/target_real', target_grid, self.current_epoch
+                'validation/target_real', target_grid_norm, self.current_epoch
             )
             self.logger.experiment.add_images(
-                'validation/prediction_real', pred_grid, self.current_epoch
+                'validation/prediction_real', pred_grid_norm, self.current_epoch
             )
             
             # Also log imaginary parts (channel 1)
@@ -150,14 +217,19 @@ class LitUNet(pl.LightningModule):
             target_imag = torch.stack([y[i, 1].cpu().unsqueeze(0) for i in range(n_examples)])
             pred_imag = torch.stack([y_hat[i, 1].detach().cpu().unsqueeze(0) for i in range(n_examples)])
             
+            # Normalize imaginary parts
+            input_imag_norm = normalize_for_tensorboard(input_imag)
+            target_imag_norm = normalize_for_tensorboard(target_imag)
+            pred_imag_norm = normalize_for_tensorboard(pred_imag)
+            
             self.logger.experiment.add_images(
-                'validation/input_imag', input_imag, self.current_epoch
+                'validation/input_imag', input_imag_norm, self.current_epoch
             )
             self.logger.experiment.add_images(
-                'validation/target_imag', target_imag, self.current_epoch
+                'validation/target_imag', target_imag_norm, self.current_epoch
             )
             self.logger.experiment.add_images(
-                'validation/prediction_imag', pred_imag, self.current_epoch
+                'validation/prediction_imag', pred_imag_norm, self.current_epoch
             )
         
         # Also save local figures as before
@@ -181,6 +253,150 @@ class LitUNet(pl.LightningModule):
         fig_path = os.path.join(fig_dir, "val_examples.png")
         plt.savefig(fig_path)
         plt.close(fig)
+
+    def _log_reconstruction_images(self, fg_grid, all_bg_grids, fg_sct_field, all_bg_fields):
+        """Log reconstruction images using all backgrounds from the dataset
+        
+        Args:
+            fg_grid: Foreground grids for the batch (B, 2, 100, 100)
+            all_bg_grids: All background grids from dataset (n_backgrounds, 2, 100, 100)
+            fg_sct_field: Foreground scattered fields for the batch (B, 2, 24, 24) 
+            all_bg_fields: All background scattered fields from dataset (n_backgrounds, 2, 24, 24)
+        """
+        with torch.no_grad():
+            batch_size = fg_grid.size(0)
+            n_backgrounds = all_bg_grids.size(0)
+            
+            # Expand backgrounds to match batch size
+            # all_bg_grids: (n_backgrounds, 2, 100, 100) -> (batch_size, n_backgrounds, 2, 100, 100)
+            bg_grid_expanded = all_bg_grids.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)
+            
+            # all_bg_fields: (n_backgrounds, 2, 24, 24) -> (batch_size, n_backgrounds, 2, 24, 24)  
+            bg_sct_field_expanded = all_bg_fields.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)
+            
+            # Perform reconstruction using all available backgrounds
+            fg_grid_reconstructed, fg_grid_mean, fg_grid_std = self.reconstruction(
+                fg_sct_field, bg_sct_field_expanded, bg_grid_expanded
+            )
+            
+            n_examples = min(4, fg_grid.size(0))
+            
+            # Log to TensorBoard with proper normalization
+            if self.logger and hasattr(self.logger, 'experiment'):
+                
+                def normalize_for_tensorboard(tensor):
+                    """Normalize tensor to [0, 1] range for TensorBoard visualization"""
+                    # Work with the original tensor shape
+                    original_shape = tensor.shape
+                    batch_size = original_shape[0]
+                    
+                    # Flatten each image in the batch individually
+                    tensor_flat = tensor.view(batch_size, -1)
+                    tensor_min = tensor_flat.min(dim=1, keepdim=True)[0]
+                    tensor_max = tensor_flat.max(dim=1, keepdim=True)[0]
+                    tensor_range = tensor_max - tensor_min
+                    
+                    # Avoid division by zero
+                    tensor_range = torch.where(tensor_range == 0, torch.ones_like(tensor_range), tensor_range)
+                    
+                    # Normalize and reshape back to original shape
+                    tensor_flat_norm = (tensor_flat - tensor_min) / tensor_range
+                    return tensor_flat_norm.view(original_shape)
+                
+                # Log original foreground grids (real part)
+                orig_fg_real = torch.stack([fg_grid[i, 0].cpu().unsqueeze(0) for i in range(n_examples)])
+                orig_fg_real_norm = normalize_for_tensorboard(orig_fg_real)
+                self.logger.experiment.add_images(
+                    'reconstruction/original_fg_real', orig_fg_real_norm, self.current_epoch
+                )
+                
+                # Log mean reconstruction (real part)
+                mean_recon_real = torch.stack([fg_grid_mean[i, 0].cpu().unsqueeze(0) for i in range(n_examples)])
+                mean_recon_real_norm = normalize_for_tensorboard(mean_recon_real)
+                self.logger.experiment.add_images(
+                    'reconstruction/mean_reconstruction_real', mean_recon_real_norm, self.current_epoch
+                )
+                
+                # Log standard deviation of reconstructions (real part)
+                std_recon_real = torch.stack([fg_grid_std[i, 0].cpu().unsqueeze(0) for i in range(n_examples)])
+                std_recon_real_norm = normalize_for_tensorboard(std_recon_real)
+                self.logger.experiment.add_images(
+                    'reconstruction/std_reconstruction_real', std_recon_real_norm, self.current_epoch
+                )
+                
+                # Log individual reconstructions for first background (real part)
+                first_bg_recon_real = torch.stack([fg_grid_reconstructed[i, 0, 0].cpu().unsqueeze(0) for i in range(n_examples)])
+                first_bg_recon_real_norm = normalize_for_tensorboard(first_bg_recon_real)
+                self.logger.experiment.add_images(
+                    'reconstruction/first_bg_reconstruction_real', first_bg_recon_real_norm, self.current_epoch
+                )
+                
+                # Also log imaginary parts
+                orig_fg_imag = torch.stack([fg_grid[i, 1].cpu().unsqueeze(0) for i in range(n_examples)])
+                orig_fg_imag_norm = normalize_for_tensorboard(orig_fg_imag)
+                self.logger.experiment.add_images(
+                    'reconstruction/original_fg_imag', orig_fg_imag_norm, self.current_epoch
+                )
+                
+                mean_recon_imag = torch.stack([fg_grid_mean[i, 1].cpu().unsqueeze(0) for i in range(n_examples)])
+                mean_recon_imag_norm = normalize_for_tensorboard(mean_recon_imag)
+                self.logger.experiment.add_images(
+                    'reconstruction/mean_reconstruction_imag', mean_recon_imag_norm, self.current_epoch
+                )
+                
+                std_recon_imag = torch.stack([fg_grid_std[i, 1].cpu().unsqueeze(0) for i in range(n_examples)])
+                std_recon_imag_norm = normalize_for_tensorboard(std_recon_imag)
+                self.logger.experiment.add_images(
+                    'reconstruction/std_reconstruction_imag', std_recon_imag_norm, self.current_epoch
+                )
+            
+            # Create comparison figure showing original vs reconstructed vs mean vs std
+            fig, axes = plt.subplots(n_examples, 4, figsize=(16, 4 * n_examples))
+            if n_examples == 1:
+                axes = axes.reshape(1, -1)
+                
+            for i in range(n_examples):
+                # Original foreground (real part)
+                axes[i, 0].imshow(fg_grid[i, 0].cpu(), cmap="viridis")
+                axes[i, 0].set_title("Original FG (real)")
+                
+                # Mean reconstruction (real part)
+                axes[i, 1].imshow(fg_grid_mean[i, 0].cpu(), cmap="viridis")
+                axes[i, 1].set_title("Mean Reconstruction (real)")
+                
+                # First background reconstruction (real part)
+                axes[i, 2].imshow(fg_grid_reconstructed[i, 0, 0].cpu(), cmap="viridis")
+                axes[i, 2].set_title("First BG Recon (real)")
+                
+                # Standard deviation (real part)
+                axes[i, 3].imshow(fg_grid_std[i, 0].cpu(), cmap="plasma")
+                axes[i, 3].set_title("Std Dev (real)")
+                
+                for j in range(4):
+                    axes[i, j].axis("off")
+                    
+            plt.tight_layout()
+            fig_dir = f"figures/epoch_{self.current_epoch}"
+            os.makedirs(fig_dir, exist_ok=True)
+            fig_path = os.path.join(fig_dir, "reconstruction_examples.png")
+            plt.savefig(fig_path)
+            plt.close(fig)
+            
+            # Log reconstruction metrics
+            with torch.no_grad():
+                # Compute reconstruction error metrics
+                recon_mae = torch.mean(torch.abs(fg_grid_mean - fg_grid))
+                recon_mse = torch.mean((fg_grid_mean - fg_grid) ** 2)
+                mean_std = torch.mean(fg_grid_std)
+                
+                self.log("recon_mae", recon_mae, on_step=False, on_epoch=True)
+                self.log("recon_mse", recon_mse, on_step=False, on_epoch=True)
+                self.log("recon_mean_std", mean_std, on_step=False, on_epoch=True)
+                
+                # Log per-channel reconstruction metrics
+                for c in range(fg_grid.shape[1]):
+                    channel_recon_mae = torch.mean(torch.abs(fg_grid_mean[:, c] - fg_grid[:, c]))
+                    self.log(f"recon_mae_channel_{c}", channel_recon_mae, on_step=False, on_epoch=True)
 
     def _log_weight_histograms(self):
         """Log weight histograms and statistics to TensorBoard"""
@@ -239,8 +455,8 @@ def load_data(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
     return cal_e_fields, grids
 
 
-def build_loaders(x: np.ndarray, y: np.ndarray, batch_size: int, val_split: float, num_workers: int, seed: int):
-    dataset = FieldsDataset(x, y)
+def build_loaders(fields: np.ndarray, grids: np.ndarray, batch_size: int, val_split: float, num_workers: int, seed: int):
+    dataset = MultiBkgDataset(fields=fields, grids=grids, n_backgrounds=5)
     n_total = len(dataset)
     n_val = max(1, int(n_total * val_split))
     n_train = n_total - n_val
@@ -258,7 +474,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--base-channels", type=int, default=64)
+    parser.add_argument("--base-channels", type=int, default=4)
     parser.add_argument("--val-split", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
@@ -266,8 +482,8 @@ def main():
 
     args = parser.parse_args()
 
-    x, y = load_data(args.data)
-    train_loader, val_loader = build_loaders(x, y, args.batch_size, args.val_split, args.num_workers, args.seed)
+    fields, grids = load_data(args.data)
+    train_loader, val_loader = build_loaders(fields, grids, args.batch_size, args.val_split, args.num_workers, args.seed)
 
     model = LitUNet(in_channels=2, out_channels=2, base_channels=args.base_channels, lr=args.lr)
 
@@ -283,7 +499,7 @@ def main():
 
     trainer = pl.Trainer(
         max_epochs=args.epochs,
-        accelerator="gpu",
+        accelerator="cpu",
         devices=1,  # Use 1 GPU (will be GPU 0 due to CUDA_VISIBLE_DEVICES)
         default_root_dir=ckpt_dir,
         log_every_n_steps=10,
