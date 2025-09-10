@@ -55,6 +55,62 @@ class LitUNet(pl.LightningModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
     
+    def clean_artifact(self, pred_tgt, bg, debug=False):
+        """Clean artifacts from prediction using edge detection and Gaussian blur"""
+        import cv2
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        bg_normed = (bg - bg.min())/bg.max()
+        pred_tgt_normed = (pred_tgt - pred_tgt.min())/pred_tgt.max()
+        # Convert to uint8 for OpenCV operations
+        pred_tgt_uint8 = (pred_tgt_normed * 255).astype(np.uint8)
+        bg_uint8 = (bg_normed * 255).astype(np.uint8)
+        
+        if debug:
+            fig, axes = plt.subplots(3, 3, figsize=(15, 10))
+            im = axes[0,0].imshow(pred_tgt_normed)
+            axes[0,0].set_title('Original Pred Target')
+            plt.colorbar(im, ax=axes[0,0])
+            axes[0,1].imshow(bg_uint8)
+            axes[0,1].set_title('Background')
+        
+        # Find edges in background
+        edges = cv2.Canny(bg_uint8, 100, 200)
+        if debug:
+            axes[0,2].imshow(edges, cmap='gray')
+            axes[0,2].set_title('Edge Detection')
+        
+        # Dilate edges to create mask
+        kernel = np.ones((5,5), np.uint8)
+        mask = cv2.dilate(edges, kernel, iterations=2)
+        if debug:
+            axes[1,0].imshow(mask, cmap='gray')
+            axes[1,0].set_title('Dilated Mask')
+        
+        # Apply Gaussian blur only to masked regions
+        blur = cv2.GaussianBlur(pred_tgt, (5,5), 0)
+        cleaned = np.where(mask[:,:] == 255, blur, pred_tgt)
+        
+        if debug:
+            axes[1,1].imshow(blur)
+            axes[1,1].set_title('Blurred Image')
+            axes[1,2].imshow(cleaned)
+            axes[1,2].set_title('Final Cleaned')
+        
+        # get weights for averaging
+        weights = np.where(mask[:,:] == 255, 0, 1)
+        if debug:
+            axes[2,0].imshow(weights)
+            axes[2,0].set_title('Weights')
+            axes[2,1].imshow(pred_tgt * weights)
+            axes[2,1].set_title('Weighted Pred Target')
+            plt.tight_layout()
+            plt.show()
+        
+        return cleaned, weights
+    
+    
     def reconstruction(self, fg_sct, bg_sct, bg_grid):
         """Reconstruct the full fg_grid from fg_sct-bg_sct and bg_grid
         by adding the background field back into the predicted contrast for each bg
@@ -64,6 +120,7 @@ class LitUNet(pl.LightningModule):
         # bg_sct: (B,nbkgs,2,24,24)
         # bg_grid: (B,nbkgs,2,100,100)
         B, nbkgs, _, H, W = bg_sct.shape
+        weights_for_mean = np.zeros((nbkgs, H, W))
         fg_sct_expanded = fg_sct.unsqueeze(1).expand(-1, nbkgs, -1, -1, -1)  # (B,nbkgs,2,24,24)
         contrast = fg_sct_expanded - bg_sct  # (B,nbkgs,2,24,24)
         contrast_reshaped = contrast.view(B * nbkgs, 2, H, W)
@@ -474,7 +531,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--base-channels", type=int, default=4)
+    parser.add_argument("--base-channels", type=int, default=64)
     parser.add_argument("--val-split", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
@@ -493,13 +550,13 @@ def main():
     # Set up TensorBoard logger
     logger = TensorBoardLogger(
         save_dir="lightning_logs",
-        name="exp_experiment",
+        name="mbg_exp_experiment",
         version=None,  # Auto-increment version
     )
 
     trainer = pl.Trainer(
         max_epochs=args.epochs,
-        accelerator="cpu",
+        accelerator="gpu",
         devices=1,  # Use 1 GPU (will be GPU 0 due to CUDA_VISIBLE_DEVICES)
         default_root_dir=ckpt_dir,
         log_every_n_steps=10,
