@@ -55,60 +55,94 @@ class LitUNet(pl.LightningModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
     
-    def clean_artifact(self, pred_tgt, bg, debug=False):
-        """Clean artifacts from prediction using edge detection and Gaussian blur"""
+    def get_mask(self, bg, debug=False):
+        """Generate a weight mask from a background field.
+        Uses Canny edge detection on a safely normalized image. Constant or near-constant
+        images produce an all-ones weight mask (no exclusion).
+        """
         import cv2
         import numpy as np
         import matplotlib.pyplot as plt
 
-        bg_normed = (bg - bg.min())/bg.max()
-        pred_tgt_normed = (pred_tgt - pred_tgt.min())/pred_tgt.max()
+        bg = np.asarray(bg)
+        bg_min = float(np.nanmin(bg))
+        bg_max = float(np.nanmax(bg))
+        rng = bg_max - bg_min
+        if not np.isfinite(rng) or rng < 1e-12:
+            # Degenerate / constant image: just use zeros image for edges later
+            bg_normed = np.zeros_like(bg, dtype=np.float32)
+        else:
+            bg_normed = (bg - bg_min) / rng
+            # Guard against tiny numerical drift
+            bg_normed = np.clip(bg_normed, 0.0, 1.0)
+
         # Convert to uint8 for OpenCV operations
-        pred_tgt_uint8 = (pred_tgt_normed * 255).astype(np.uint8)
-        bg_uint8 = (bg_normed * 255).astype(np.uint8)
-        
-        if debug:
-            fig, axes = plt.subplots(3, 3, figsize=(15, 10))
-            im = axes[0,0].imshow(pred_tgt_normed)
-            axes[0,0].set_title('Original Pred Target')
-            plt.colorbar(im, ax=axes[0,0])
-            axes[0,1].imshow(bg_uint8)
-            axes[0,1].set_title('Background')
-        
-        # Find edges in background
+        bg_uint8 = (bg_normed * 255.0).round().astype(np.uint8)
+
+        # Find edges in background (on constant images this will be all zeros)
         edges = cv2.Canny(bg_uint8, 100, 200)
-        if debug:
-            axes[0,2].imshow(edges, cmap='gray')
-            axes[0,2].set_title('Edge Detection')
-        
-        # Dilate edges to create mask
-        kernel = np.ones((5,5), np.uint8)
+
+        # Dilate edges to create mask of regions to exclude
+        kernel = np.ones((5, 5), np.uint8)
         mask = cv2.dilate(edges, kernel, iterations=2)
+
+        # weights: 0 where edges (dilated), 1 elsewhere
+        weights = np.where(mask == 255, 0, 1).astype(np.float32)
+
         if debug:
-            axes[1,0].imshow(mask, cmap='gray')
-            axes[1,0].set_title('Dilated Mask')
-        
-        # Apply Gaussian blur only to masked regions
-        blur = cv2.GaussianBlur(pred_tgt, (5,5), 0)
-        cleaned = np.where(mask[:,:] == 255, blur, pred_tgt)
-        
-        if debug:
-            axes[1,1].imshow(blur)
-            axes[1,1].set_title('Blurred Image')
-            axes[1,2].imshow(cleaned)
-            axes[1,2].set_title('Final Cleaned')
-        
-        # get weights for averaging
-        weights = np.where(mask[:,:] == 255, 0, 1)
-        if debug:
-            axes[2,0].imshow(weights)
-            axes[2,0].set_title('Weights')
-            axes[2,1].imshow(pred_tgt * weights)
-            axes[2,1].set_title('Weighted Pred Target')
-            plt.tight_layout()
-            plt.show()
-        
-        return cleaned, weights
+            fig, ax = plt.subplots(1, 4, figsize=(10, 3))
+            ax[0].imshow(bg, cmap='viridis'); ax[0].set_title('bg'); ax[0].axis('off')
+            ax[1].imshow(bg_normed, cmap='viridis'); ax[1].set_title('normed'); ax[1].axis('off')
+            ax[2].imshow(edges, cmap='gray'); ax[2].set_title('edges'); ax[2].axis('off')
+            ax[3].imshow(weights, cmap='gray'); ax[3].set_title('weights'); ax[3].axis('off')
+            plt.tight_layout(); plt.show()
+        return weights
+
+    def get_bkg_masks(self, bg_grids):
+        """Get masks for each background grid to identify valid regions.
+        Supports inputs of shape:
+          (nbkgs, 2, H, W) or (B, nbkgs, 2, H, W)
+        Returns a tensor/ndarray of same leading dimensionality with masks in {0,1}.
+        """
+        import cv2
+        import numpy as np
+        import torch
+
+        # Accept torch or numpy input
+        is_torch = isinstance(bg_grids, torch.Tensor)
+        device = bg_grids.device if is_torch else None
+        if is_torch:
+            grids_np = bg_grids.detach().cpu().numpy()
+        else:
+            grids_np = bg_grids
+
+        if grids_np.ndim == 4:  # (nbkgs,2,H,W)
+            grids_np = grids_np[None, ...]  # add batch dim -> (1,nbkgs,2,H,W)
+            added_batch = True
+        elif grids_np.ndim == 5:  # (B,nbkgs,2,H,W)
+            added_batch = False
+        else:
+            raise ValueError(f"bg_grids must have 4 or 5 dims, got {grids_np.shape}")
+
+        B, nbkgs, _, H, W = grids_np.shape
+        masks_np = np.zeros((B, nbkgs, 2, H, W), dtype=np.float32)
+
+        for b in range(B):
+            for k in range(nbkgs):
+                bg_real = grids_np[b, k, 0]
+                bg_imag = grids_np[b, k, 1]
+                masks_np[b, k, 0] = self.get_mask(bg_real)
+                masks_np[b, k, 1] = self.get_mask(bg_imag)
+
+        # Remove artificial batch dim if originally absent
+        if added_batch:
+            masks_np = masks_np[0]  # (nbkgs,2,H,W)
+
+        if is_torch:
+            return torch.from_numpy(masks_np).to(device)
+        return masks_np
+
+
     
     
     def reconstruction(self, fg_sct, bg_sct, bg_grid):
@@ -120,24 +154,39 @@ class LitUNet(pl.LightningModule):
         # bg_sct: (B,nbkgs,2,24,24)
         # bg_grid: (B,nbkgs,2,100,100)
         B, nbkgs, _, H, W = bg_sct.shape
-        weights_for_mean = np.zeros((nbkgs, H, W))
+        # Updated: get_bkg_masks now returns shape (B,nbkgs,2,100,100)
+        weights_for_mean = self.get_bkg_masks(bg_grid)  # (B,nbkgs,2,100,100) or (nbkgs,2,100,100)
+        if weights_for_mean.dim() == 4:  # no batch dim, expand to match
+            weights_for_mean = weights_for_mean.unsqueeze(0).expand(B, -1, -1, -1, -1)
+
         fg_sct_expanded = fg_sct.unsqueeze(1).expand(-1, nbkgs, -1, -1, -1)  # (B,nbkgs,2,24,24)
         contrast = fg_sct_expanded - bg_sct  # (B,nbkgs,2,24,24)
         contrast_reshaped = contrast.view(B * nbkgs, 2, H, W)
         pred_contrast_grid = self(contrast_reshaped)  # (B*nbkgs,2,100,100)
         pred_contrast_grid = pred_contrast_grid.view(B, nbkgs, 2, 100, 100)
-        # Reconstruct fg_grid by adding bg_grid back
-        # fg_grid = pred_contrast_grid * bg_grid + bg_grid
-        # first convert pred_contrast_grid and bg_grid to complex to handle complex arithmetic correctly
-        # Note: For channels-first format (B,nbkgs,2,H,W), real is channel 0, imag is channel 1
+
+        # Complex reconstruction
         pred_contrast_complex = pred_contrast_grid[:, :, 0] + 1j * pred_contrast_grid[:, :, 1]
         bg_grid_complex = bg_grid[:, :, 0] + 1j * bg_grid[:, :, 1]
         fg_grid_complex = pred_contrast_complex * bg_grid_complex + bg_grid_complex
-        # Convert back to channels-first format with torch.stack
         fg_grid = torch.stack([fg_grid_complex.real, fg_grid_complex.imag], dim=2)  # (B,nbkgs,2,100,100)
+
+        # Unweighted stats (kept for backward compatibility)
         fg_grid_mu = fg_grid.mean(dim=1)  # (B,2,100,100)
         fg_grid_deviation = torch.std(fg_grid, dim=1)  # (B,2,100,100)
-        return fg_grid, fg_grid_mu, fg_grid_deviation
+
+        # Weighted stats (currently unused in return but computed with new batched masks)
+        weighted_sum = torch.sum(fg_grid * weights_for_mean, dim=1)  # (B,2,100,100)
+        weight_totals = torch.sum(weights_for_mean, dim=1)  # (B,2,100,100)
+        mask = weight_totals > 0
+        weighted_mean = torch.zeros_like(fg_grid_mu)
+        weighted_mean[mask] = weighted_sum[mask] / (weight_totals[mask] + 1e-8)
+        weighted_sq_sum = torch.sum((fg_grid - weighted_mean.unsqueeze(1)) ** 2 * weights_for_mean, dim=1)
+        weighted_var = weighted_sq_sum / (weight_totals + 1e-8)
+        weighted_std = torch.sqrt(weighted_var)
+        # (If desired later, can swap fg_grid_mu/fg_grid_deviation with weighted versions.)
+
+        return fg_grid, weighted_mean, weighted_std
 
 
     def training_step(self, batch, batch_idx: int):
@@ -202,7 +251,7 @@ class LitUNet(pl.LightningModule):
                 self.log(f"val_mae_channel_{c}", channel_mae, on_step=False, on_epoch=True)
         
         # Log images to TensorBoard every 5 epochs
-        if batch_idx == 0 and (self.current_epoch + 1) % 5 == 0:
+        if batch_idx == 0 and (self.current_epoch) % 5 == 0:
             self._log_images_to_tensorboard(x, y, y_hat)
             self._log_reconstruction_images(fg_grid, all_bg_grids, fg_sct_field, all_bg_fields)
             
@@ -536,6 +585,7 @@ def main():
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fast-dev-run", action="store_true")
+    parser.add_argument("--debug-recon", action="store_true", help="Run a single debug reconstruction before training")
 
     args = parser.parse_args()
 
@@ -543,6 +593,58 @@ def main():
     train_loader, val_loader = build_loaders(fields, grids, args.batch_size, args.val_split, args.num_workers, args.seed)
 
     model = LitUNet(in_channels=2, out_channels=2, base_channels=args.base_channels, lr=args.lr)
+
+    # Debug reconstruction (one-off) before training starts
+    if args.debug_recon:
+        print("[Debug] Starting reconstruction debug run...")
+        model.eval()
+        with torch.no_grad():
+            # Get first batch
+            try:
+                batch = next(iter(train_loader))
+            except StopIteration:
+                raise RuntimeError("Train loader is empty; cannot run debug reconstruction.")
+            x, y, fg_grid, bg_grid_single, fg_sct_field, bg_sct_field_single = batch
+            # Access underlying dataset to fetch all backgrounds
+            base_ds = train_loader.dataset
+            if hasattr(base_ds, 'dataset'):
+                base_ds = base_ds.dataset  # unwrap Subset
+            if not hasattr(base_ds, 'get_backgrounds'):
+                raise AttributeError("Underlying dataset does not implement get_backgrounds().")
+            all_bg_grids, all_bg_fields = base_ds.get_backgrounds()  # (nbkgs,2,100,100),(nbkgs,2,24,24)
+
+            B = fg_sct_field.shape[0]
+            nbkgs = all_bg_grids.shape[0]
+            # Expand backgrounds across batch
+            bg_grid_expanded = all_bg_grids.unsqueeze(0).expand(B, -1, -1, -1, -1)  # (B,nbkgs,2,100,100)
+            bg_sct_field_expanded = all_bg_fields.unsqueeze(0).expand(B, -1, -1, -1, -1)  # (B,nbkgs,2,24,24)
+
+            # Perform reconstruction
+            recon_all, recon_mean, recon_std = model.reconstruction(
+                fg_sct_field, bg_sct_field_expanded, bg_grid_expanded
+            )
+
+            # Compute simple metrics
+            mae = torch.mean(torch.abs(recon_mean - fg_grid))
+            mse = torch.mean((recon_mean - fg_grid) ** 2)
+            print(f"[Debug] Reconstruction shapes: all={tuple(recon_all.shape)} mean={tuple(recon_mean.shape)} std={tuple(recon_std.shape)}")
+            print(f"[Debug] Reconstruction MAE (vs fg_grid): {mae.item():.6f} | MSE: {mse.item():.6f}")
+            # Optionally save one figure
+            try:
+                import matplotlib.pyplot as plt
+                os.makedirs('figures/debug', exist_ok=True)
+                idx = 0
+                plt.figure(figsize=(10,3))
+                plt.subplot(1,3,1); plt.imshow(fg_grid[idx,0].cpu(), cmap='viridis'); plt.title('FG Real'); plt.axis('off')
+                plt.subplot(1,3,2); plt.imshow(recon_mean[idx,0].cpu(), cmap='viridis'); plt.title('Recon Mean Real'); plt.axis('off')
+                plt.subplot(1,3,3); plt.imshow(recon_std[idx,0].cpu(), cmap='plasma'); plt.title('Recon Std Real'); plt.axis('off')
+                plt.tight_layout()
+                plt.savefig('figures/debug/reconstruction_debug.png')
+                plt.close()
+                print("[Debug] Saved debug reconstruction figure to figures/debug/reconstruction_debug.png")
+            except Exception as e:
+                print(f"[Debug] Failed to save debug figure: {e}")
+        print("[Debug] Reconstruction debug run complete. Proceeding to training...")
 
     ckpt_dir = os.path.join("checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -556,7 +658,7 @@ def main():
 
     trainer = pl.Trainer(
         max_epochs=args.epochs,
-        accelerator="gpu",
+        accelerator="cpu",
         devices=1,  # Use 1 GPU (will be GPU 0 due to CUDA_VISIBLE_DEVICES)
         default_root_dir=ckpt_dir,
         log_every_n_steps=10,
