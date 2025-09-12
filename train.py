@@ -565,17 +565,18 @@ def load_data(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
     grids = data_main.split_complex_to_real_imag(grids)       # (N,100,100,2)
     synth_fields = data_main.split_complex_to_real_imag(synth_fields)  # (N,24,24,2)
     cal_e_fields = data_main.split_complex_to_real_imag(cal_e_fields)  # (N,24,24,2)
+    uncal_spars = data_main.split_complex_to_real_imag(uncal_spars)  # (N,24,24,2)
 
     # Cast to float32 for training
     grids = grids.astype(np.float32, copy=False)
     synth_fields = synth_fields.astype(np.float32, copy=False)
     cal_e_fields = cal_e_fields.astype(np.float32, copy=False)
-    return synth_fields, cal_e_fields, grids
+    return synth_fields, cal_e_fields, grids, uncal_spars
 
 
 def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers: int, seed: int):
-    synth_fields, cal_e_fields, grids = load_data(file_path)
-    synth_dataset = MultiBkgDataset(fields=synth_fields, grids=grids, n_backgrounds=5)
+    synth_fields, cal_e_fields, grids, uncal_spars = load_data(file_path)
+    synth_dataset = MultiBkgDataset(fields=synth_fields, grids=grids, n_backgrounds=25)
     exp_dataset = FieldsDataset(x_np=cal_e_fields, y_np=grids)
     n_total = len(synth_dataset)
     n_val = max(1, int(n_total * val_split))
@@ -585,14 +586,14 @@ def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers:
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    test_loader = DataLoader(exp_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    test_loader = DataLoader(exp_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     return train_loader, val_loader, test_loader
 
 
 def test(
     model: LitUNet,
     test_loader,
-    num_cases: int = 5,
+    num_cases: int = 10,
     output_dir: str = "figures/test",
     device: str | None = None,
 ):
@@ -668,7 +669,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train UNet to map synth fields (24x24x2) -> grids (100x100x2)")
     parser.add_argument("--data", type=str, default="all_data.mat", help="Path to .mat file")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--base-channels", type=int, default=64)
     parser.add_argument("--val-split", type=float, default=0.05)
@@ -678,6 +679,8 @@ def main():
     parser.add_argument("--debug-recon", action="store_true", help="Run a single debug reconstruction before training")
     parser.add_argument("--test-only", action="store_true", help="Skip training and run test on a checkpoint.")
     parser.add_argument("--ckpt-path", type=str, default=None, help="Path to checkpoint for testing. If None, finds latest.")
+
+    EXPERIMENT_TAG = "mbg_train_synth_test_cal_exp_25bkgs"
 
     args = parser.parse_args()
 
@@ -706,8 +709,8 @@ def main():
             lr=args.lr
         )
 
-        logger = TensorBoardLogger(save_dir="lightning_logs", name="mbg_exp_experiment")
-        
+        logger = TensorBoardLogger(save_dir="lightning_logs", name=EXPERIMENT_TAG)
+
         checkpoint_callback = ModelCheckpoint(
             monitor='val_loss',
             dirpath=os.path.join(logger.log_dir, 'checkpoints'),
@@ -718,7 +721,7 @@ def main():
 
         trainer = pl.Trainer(
             max_epochs=args.epochs,
-            accelerator="cpu",
+            accelerator="gpu",
             devices=1,
             log_every_n_steps=10,
             logger=logger,
@@ -741,7 +744,7 @@ def main():
         if ckpt_path is None:
             print("No checkpoint path provided, finding the latest...")
             # Find the most recently modified checkpoint file
-            list_of_files = glob.glob('lightning_logs/mbg_exp_experiment/version_*/checkpoints/*.ckpt')
+            list_of_files = glob.glob(f'lightning_logs/{EXPERIMENT_TAG}/version_*/checkpoints/*.ckpt')
             if not list_of_files:
                 raise FileNotFoundError("No checkpoints found to test.")
             ckpt_path = max(list_of_files, key=os.path.getctime)
