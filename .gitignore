@@ -1,6 +1,7 @@
 checkpoints
 *.mat
-figures
+figures-sep11/
+figures/
 .venv
 .idea
 **__pycache__**

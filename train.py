@@ -3,12 +3,14 @@ import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 import argparse
+import glob
 from typing import Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 import matplotlib.pyplot as plt
 
@@ -26,7 +28,7 @@ class FieldsDataset(Dataset):
     """
 
     def __init__(self, x_np: np.ndarray, y_np: np.ndarray, dtype: torch.dtype = torch.float32):
-        assert x_np.ndim == 4 and y_np.ndim == 4, "Expected (N,H,W,C) arrays"
+        assert x_np.ndim == 4 and y_np.ndim == 4, "Expected (N,H,W) arrays"
         assert x_np.shape[0] == y_np.shape[0], "Mismatched batch sizes"
         assert x_np.shape[-1] == 2 and y_np.shape[-1] == 2, "Expected 2-channel real/imag in last dim"
         self.x = x_np
@@ -46,14 +48,34 @@ class FieldsDataset(Dataset):
 
 
 class LitUNet(pl.LightningModule):
-    def __init__(self, in_channels: int = 2, out_channels: int = 2, base_channels: int = 64, lr: float = 1e-3):
+    def __init__(
+        self,
+        bkgs: torch.Tensor | None = None,
+        bkg_sct_fields: torch.Tensor | None = None,
+        in_channels: int = 2,
+        out_channels: int = 2,
+        base_channels: int = 64,
+        lr: float = 1e-3,
+    ):
         super().__init__()
-        self.save_hyperparameters()
+        # Save hyperparameters, ignoring large tensors.
+        self.save_hyperparameters(ignore=['bkgs', 'bkg_sct_fields'])
         self.model = UNet(in_channels=in_channels, out_channels=out_channels, base_channels=base_channels)
         self.criterion = torch.nn.MSELoss()
 
+        # Register buffers. They will be populated from the checkpoint if loading.
+        if bkgs is not None and bkg_sct_fields is not None:
+            self.register_buffer('bkgs', bkgs)
+            self.register_buffer('bkg_sct_fields', bkg_sct_fields)
+        if bkgs is not None:
+            assert self.bkgs.dim() == 4 and self.bkgs.shape[1:] == (2, 100, 100)
+        if bkg_sct_fields is not None:
+            assert self.bkg_sct_fields.dim() == 4 and self.bkg_sct_fields.shape[1:] == (2, 24, 24)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
+    
+
     
     def get_mask(self, bg, debug=False):
         """Generate a weight mask from a background field.
@@ -221,16 +243,9 @@ class LitUNet(pl.LightningModule):
     def validation_step(self, batch, batch_idx: int):
         x, y, fg_grid, bg_grid, fg_sct_field, bg_sct_field = batch
 
-        # Get all backgrounds from the dataset for proper reconstruction evaluation
-        dataset = self.trainer.val_dataloaders.dataset
-        if hasattr(dataset, 'dataset'):  # Handle case where it's wrapped in a Subset
-            dataset = dataset.dataset
-        all_bg_grids, all_bg_fields = dataset.get_backgrounds()
-        
-        # Move to device
-        all_bg_grids = all_bg_grids.to(self.device)
-        all_bg_fields = all_bg_fields.to(self.device)
-        
+        # Use the backgrounds stored in the model for reconstruction evaluation
+        all_bg_grids = self.bkgs
+        all_bg_fields = self.bkg_sct_fields
         
         y_hat = self(x)
         val_loss = self.criterion(y_hat, y)
@@ -437,19 +452,21 @@ class LitUNet(pl.LightningModule):
                     'reconstruction/first_bg_reconstruction_real', first_bg_recon_real_norm, self.current_epoch
                 )
                 
-                # Also log imaginary parts
+                # Log original foreground grids (imaginary part)
                 orig_fg_imag = torch.stack([fg_grid[i, 1].cpu().unsqueeze(0) for i in range(n_examples)])
                 orig_fg_imag_norm = normalize_for_tensorboard(orig_fg_imag)
                 self.logger.experiment.add_images(
                     'reconstruction/original_fg_imag', orig_fg_imag_norm, self.current_epoch
                 )
                 
+                # Log mean reconstruction (imaginary part)
                 mean_recon_imag = torch.stack([fg_grid_mean[i, 1].cpu().unsqueeze(0) for i in range(n_examples)])
                 mean_recon_imag_norm = normalize_for_tensorboard(mean_recon_imag)
                 self.logger.experiment.add_images(
                     'reconstruction/mean_reconstruction_imag', mean_recon_imag_norm, self.current_epoch
                 )
                 
+                # Log standard deviation of reconstructions (imaginary part)
                 std_recon_imag = torch.stack([fg_grid_std[i, 1].cpu().unsqueeze(0) for i in range(n_examples)])
                 std_recon_imag_norm = normalize_for_tensorboard(std_recon_imag)
                 self.logger.experiment.add_images(
@@ -493,11 +510,11 @@ class LitUNet(pl.LightningModule):
                 # Compute reconstruction error metrics
                 recon_mae = torch.mean(torch.abs(fg_grid_mean - fg_grid))
                 recon_mse = torch.mean((fg_grid_mean - fg_grid) ** 2)
-                mean_std = torch.mean(fg_grid_std)
+                recon_mean_std = torch.mean(fg_grid_std)
                 
                 self.log("recon_mae", recon_mae, on_step=False, on_epoch=True)
                 self.log("recon_mse", recon_mse, on_step=False, on_epoch=True)
-                self.log("recon_mean_std", mean_std, on_step=False, on_epoch=True)
+                self.log("recon_mean_std", recon_mean_std, on_step=False, on_epoch=True)
                 
                 # Log per-channel reconstruction metrics
                 for c in range(fg_grid.shape[1]):
@@ -558,21 +575,99 @@ def load_data(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
     grids = grids.astype(np.float32, copy=False)
     synth_fields = synth_fields.astype(np.float32, copy=False)
     cal_e_fields = cal_e_fields.astype(np.float32, copy=False)
-    return cal_e_fields, grids
+    return synth_fields, cal_e_fields, grids
 
 
-def build_loaders(fields: np.ndarray, grids: np.ndarray, batch_size: int, val_split: float, num_workers: int, seed: int):
-    dataset = MultiBkgDataset(fields=fields, grids=grids, n_backgrounds=5)
-    n_total = len(dataset)
+def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers: int, seed: int):
+    synth_fields, cal_e_fields, grids = load_data(file_path)
+    synth_dataset = MultiBkgDataset(fields=synth_fields, grids=grids, n_backgrounds=5)
+    exp_dataset = FieldsDataset(x_np=cal_e_fields, y_np=grids)
+    n_total = len(synth_dataset)
     n_val = max(1, int(n_total * val_split))
     n_train = n_total - n_val
     g = torch.Generator().manual_seed(seed)
-    train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=g)
+    train_ds, val_ds = random_split(synth_dataset, [n_train, n_val], generator=g)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    return train_loader, val_loader
+    test_loader = DataLoader(exp_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    return train_loader, val_loader, test_loader
 
+
+def test(
+    model: LitUNet,
+    test_loader,
+    num_cases: int = 5,
+    output_dir: str = "figures/test",
+    device: str | None = None,
+):
+    """Run reconstruction on a handful of test samples using backgrounds stored in the model.
+
+    Args:
+        model: Trained LitUNet instance with internal backgrounds (bkgs & bkg_sct_fields buffers).
+        test_loader: DataLoader providing experimental (x,y) pairs (x: (B,2,24,24), y: (B,2,100,100)).
+        num_cases: Number of individual samples to visualize.
+        output_dir: Directory to save figures.
+        device: Optional device override.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    model.to(device)
+    model.eval()
+
+    collected = 0
+    with torch.no_grad():
+        for batch in test_loader:
+            # FieldsDataset returns (x,y)
+            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                x, y = batch[:2]
+            else:
+                raise RuntimeError("Expected (x,y) batch from test_loader")
+            B = x.shape[0]
+            take = min(B, num_cases - collected)
+            if take <= 0:
+                break
+            x = x.to(device)[:take]
+            y = y.to(device)[:take]
+
+            nbkgs = model.bkgs.shape[0]
+            assert nbkgs > 0, "Model has no backgrounds stored for reconstruction."
+            bg_grid = model.bkgs.unsqueeze(0).expand(take, -1, -1, -1, -1)          # (take,nbkgs,2,100,100)
+            bg_sct = model.bkg_sct_fields.unsqueeze(0).expand(take, -1, -1, -1, -1)  # (take,nbkgs,2,24,24)
+
+            per_bkg_recons, mean_recon, std_recon = model.reconstruction(x, bg_sct, bg_grid)
+            mae = torch.mean(torch.abs(mean_recon - y)).item()
+            mse = torch.mean((mean_recon - y) ** 2).item()
+            print(f"Samples {collected}-{collected+take} MAE={mae:.4e} MSE={mse:.4e}")
+
+            for i in range(take):
+                idx_global = collected + i
+                fig, axes = plt.subplots(2, 5, figsize=(18, 6))
+                fig.suptitle(f"Test Sample {idx_global}")
+                def show(ax, tensor2d, title, cmap='viridis'):
+                    im = ax.imshow(tensor2d, cmap=cmap)
+                    ax.set_title(title, fontsize=9)
+                    ax.axis('off')
+                    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                show(axes[0,0], y[i,0].cpu(), 'GT (Real)')
+                show(axes[0,1], mean_recon[i,0].cpu(), 'Mean Recon (Real)')
+                show(axes[0,2], per_bkg_recons[i,0].cpu(), 'First BG (Real)')
+                show(axes[0,3], std_recon[i,0].cpu(), 'Std (Real)', cmap='plasma')
+                show(axes[0,4], torch.abs(mean_recon[i,0]-y[i,0]).cpu(), 'Abs Err (Real)', cmap='magma')
+                show(axes[1,0], y[i,1].cpu(), 'GT (Imag)')
+                show(axes[1,1], mean_recon[i,1].cpu(), 'Mean Recon (Imag)')
+                show(axes[1,2], per_bkg_recons[i,0,1].cpu(), 'First BG (Imag)')
+                show(axes[1,3], std_recon[i,1].cpu(), 'Std (Imag)', cmap='plasma')
+                show(axes[1,4], torch.abs(mean_recon[i,1]-y[i,1]).cpu(), 'Abs Err (Imag)', cmap='magma')
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f"sample_{idx_global}.png"), dpi=150)
+                plt.close(fig)
+            collected += take
+            if collected >= num_cases:
+                break
+    print(f"Saved {collected} test reconstruction figures to {output_dir}")
 
 def main():
     parser = argparse.ArgumentParser(description="Train UNet to map synth fields (24x24x2) -> grids (100x100x2)")
@@ -586,89 +681,85 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fast-dev-run", action="store_true")
     parser.add_argument("--debug-recon", action="store_true", help="Run a single debug reconstruction before training")
+    parser.add_argument("--test-only", action="store_true", help="Skip training and run test on a checkpoint.")
+    parser.add_argument("--ckpt-path", type=str, default=None, help="Path to checkpoint for testing. If None, finds latest.")
 
     args = parser.parse_args()
 
-    fields, grids = load_data(args.data)
-    train_loader, val_loader = build_loaders(fields, grids, args.batch_size, args.val_split, args.num_workers, args.seed)
+    train_loader, val_loader, test_loader = build_loaders(
+        file_path=args.data,
+        batch_size=args.batch_size,
+        val_split=args.val_split,
+        num_workers=args.num_workers,
+        seed=args.seed,
+    )
 
-    model = LitUNet(in_channels=2, out_channels=2, base_channels=args.base_channels, lr=args.lr)
+    if not args.test_only:
+        # --- Training Phase ---
+        train_base_ds = train_loader.dataset.dataset if hasattr(train_loader.dataset, 'dataset') else train_loader.dataset
+        if not hasattr(train_base_ds, 'get_backgrounds'):
+            raise RuntimeError("Training dataset cannot provide backgrounds.")
+        
+        bg_grids_tensor, bg_fields_tensor = train_base_ds.get_backgrounds()
 
-    # Debug reconstruction (one-off) before training starts
-    if args.debug_recon:
-        print("[Debug] Starting reconstruction debug run...")
-        model.eval()
-        with torch.no_grad():
-            # Get first batch
-            try:
-                batch = next(iter(train_loader))
-            except StopIteration:
-                raise RuntimeError("Train loader is empty; cannot run debug reconstruction.")
-            x, y, fg_grid, bg_grid_single, fg_sct_field, bg_sct_field_single = batch
-            # Access underlying dataset to fetch all backgrounds
-            base_ds = train_loader.dataset
-            if hasattr(base_ds, 'dataset'):
-                base_ds = base_ds.dataset  # unwrap Subset
-            if not hasattr(base_ds, 'get_backgrounds'):
-                raise AttributeError("Underlying dataset does not implement get_backgrounds().")
-            all_bg_grids, all_bg_fields = base_ds.get_backgrounds()  # (nbkgs,2,100,100),(nbkgs,2,24,24)
+        model = LitUNet(
+            bkgs=bg_grids_tensor,
+            bkg_sct_fields=bg_fields_tensor,
+            in_channels=2,
+            out_channels=2,
+            base_channels=args.base_channels,
+            lr=args.lr
+        )
 
-            B = fg_sct_field.shape[0]
-            nbkgs = all_bg_grids.shape[0]
-            # Expand backgrounds across batch
-            bg_grid_expanded = all_bg_grids.unsqueeze(0).expand(B, -1, -1, -1, -1)  # (B,nbkgs,2,100,100)
-            bg_sct_field_expanded = all_bg_fields.unsqueeze(0).expand(B, -1, -1, -1, -1)  # (B,nbkgs,2,24,24)
+        logger = TensorBoardLogger(save_dir="lightning_logs", name="mbg_exp_experiment")
+        
+        checkpoint_callback = ModelCheckpoint(
+            monitor='val_loss',
+            dirpath=os.path.join(logger.log_dir, 'checkpoints'),
+            filename='best-checkpoint-{epoch:02d}-{val_loss:.2f}',
+            save_top_k=1,
+            mode='min',
+        )
 
-            # Perform reconstruction
-            recon_all, recon_mean, recon_std = model.reconstruction(
-                fg_sct_field, bg_sct_field_expanded, bg_grid_expanded
-            )
+        trainer = pl.Trainer(
+            max_epochs=args.epochs,
+            accelerator="gpu",
+            devices=1,
+            log_every_n_steps=10,
+            logger=logger,
+            fast_dev_run=args.fast_dev_run,
+            deterministic=True,
+            callbacks=[checkpoint_callback],
+        )
 
-            # Compute simple metrics
-            mae = torch.mean(torch.abs(recon_mean - fg_grid))
-            mse = torch.mean((recon_mean - fg_grid) ** 2)
-            print(f"[Debug] Reconstruction shapes: all={tuple(recon_all.shape)} mean={tuple(recon_mean.shape)} std={tuple(recon_std.shape)}")
-            print(f"[Debug] Reconstruction MAE (vs fg_grid): {mae.item():.6f} | MSE: {mse.item():.6f}")
-            # Optionally save one figure
-            try:
-                import matplotlib.pyplot as plt
-                os.makedirs('figures/debug', exist_ok=True)
-                idx = 0
-                plt.figure(figsize=(10,3))
-                plt.subplot(1,3,1); plt.imshow(fg_grid[idx,0].cpu(), cmap='viridis'); plt.title('FG Real'); plt.axis('off')
-                plt.subplot(1,3,2); plt.imshow(recon_mean[idx,0].cpu(), cmap='viridis'); plt.title('Recon Mean Real'); plt.axis('off')
-                plt.subplot(1,3,3); plt.imshow(recon_std[idx,0].cpu(), cmap='plasma'); plt.title('Recon Std Real'); plt.axis('off')
-                plt.tight_layout()
-                plt.savefig('figures/debug/reconstruction_debug.png')
-                plt.close()
-                print("[Debug] Saved debug reconstruction figure to figures/debug/reconstruction_debug.png")
-            except Exception as e:
-                print(f"[Debug] Failed to save debug figure: {e}")
-        print("[Debug] Reconstruction debug run complete. Proceeding to training...")
+        print("--- Starting Training ---")
+        trainer.fit(model, train_loader, val_loader)
+        print("--- Training Finished ---")
+        
+        # Use the path to the best checkpoint saved during training
+        ckpt_path = checkpoint_callback.best_model_path
+        print(f"Best checkpoint from training: {ckpt_path}")
 
-    ckpt_dir = os.path.join("checkpoints")
-    os.makedirs(ckpt_dir, exist_ok=True)
+    else:
+        # --- Test-Only Phase ---
+        ckpt_path = args.ckpt_path
+        if ckpt_path is None:
+            print("No checkpoint path provided, finding the latest...")
+            # Find the most recently modified checkpoint file
+            list_of_files = glob.glob('lightning_logs/mbg_exp_experiment/version_*/checkpoints/*.ckpt')
+            if not list_of_files:
+                raise FileNotFoundError("No checkpoints found to test.")
+            ckpt_path = max(list_of_files, key=os.path.getctime)
+        
+        print(f"Loading model from checkpoint: {ckpt_path}")
+
+    # --- Testing Phase ---
+    print(f"--- Starting Test Phase on {ckpt_path} ---")
+    # Load model from checkpoint for testing
+    model = LitUNet.load_from_checkpoint(ckpt_path)
     
-    # Set up TensorBoard logger
-    logger = TensorBoardLogger(
-        save_dir="lightning_logs",
-        name="mbg_exp_experiment",
-        version=None,  # Auto-increment version
-    )
-
-    trainer = pl.Trainer(
-        max_epochs=args.epochs,
-        accelerator="cpu",
-        devices=1,  # Use 1 GPU (will be GPU 0 due to CUDA_VISIBLE_DEVICES)
-        default_root_dir=ckpt_dir,
-        log_every_n_steps=10,
-        logger=logger,
-        fast_dev_run=args.fast_dev_run,
-        deterministic=True,
-        enable_checkpointing=True,
-    )
-
-    trainer.fit(model, train_loader, val_loader)
+    test(model=model, test_loader=test_loader)
+    print("--- Test Finished ---")
 
 
 if __name__ == "__main__":
