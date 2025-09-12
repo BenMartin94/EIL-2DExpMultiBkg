@@ -64,13 +64,16 @@ class LitUNet(pl.LightningModule):
         self.criterion = torch.nn.MSELoss()
 
         # Register buffers. They will be populated from the checkpoint if loading.
-        if bkgs is not None and bkg_sct_fields is not None:
+        if bkgs is None:
+            self.register_buffer('bkgs', torch.zeros(5, 2, 100, 100))
+        else:
             self.register_buffer('bkgs', bkgs)
+
+        if bkg_sct_fields is None:
+            self.register_buffer('bkg_sct_fields', torch.zeros(5, 2, 24, 24))
+
+        else:
             self.register_buffer('bkg_sct_fields', bkg_sct_fields)
-        if bkgs is not None:
-            assert self.bkgs.dim() == 4 and self.bkgs.shape[1:] == (2, 100, 100)
-        if bkg_sct_fields is not None:
-            assert self.bkg_sct_fields.dim() == 4 and self.bkg_sct_fields.shape[1:] == (2, 24, 24)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
@@ -266,7 +269,7 @@ class LitUNet(pl.LightningModule):
                 self.log(f"val_mae_channel_{c}", channel_mae, on_step=False, on_epoch=True)
         
         # Log images to TensorBoard every 5 epochs
-        if batch_idx == 0 and (self.current_epoch) % 5 == 0:
+        if batch_idx == 0 and (self.current_epoch+1) % 5 == 0:
             self._log_images_to_tensorboard(x, y, y_hat)
             self._log_reconstruction_images(fg_grid, all_bg_grids, fg_sct_field, all_bg_fields)
             
@@ -653,12 +656,12 @@ def test(
                     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
                 show(axes[0,0], y[i,0].cpu(), 'GT (Real)')
                 show(axes[0,1], mean_recon[i,0].cpu(), 'Mean Recon (Real)')
-                show(axes[0,2], per_bkg_recons[i,0].cpu(), 'First BG (Real)')
-                show(axes[0,3], std_recon[i,0].cpu(), 'Std (Real)', cmap='plasma')
-                show(axes[0,4], torch.abs(mean_recon[i,0]-y[i,0]).cpu(), 'Abs Err (Real)', cmap='magma')
+                show(axes[0,2], bg_grid[i,0,0].cpu(), 'First BG (Real)')
                 show(axes[1,0], y[i,1].cpu(), 'GT (Imag)')
                 show(axes[1,1], mean_recon[i,1].cpu(), 'Mean Recon (Imag)')
-                show(axes[1,2], per_bkg_recons[i,0,1].cpu(), 'First BG (Imag)')
+                show(axes[1,2], bg_grid[i,0,1].cpu(), 'First BG (Imag)')
+                show(axes[0,3], std_recon[i,0].cpu(), 'Std (Real)', cmap='plasma')
+                show(axes[0,4], torch.abs(mean_recon[i,0]-y[i,0]).cpu(), 'Abs Err (Real)', cmap='magma')
                 show(axes[1,3], std_recon[i,1].cpu(), 'Std (Imag)', cmap='plasma')
                 show(axes[1,4], torch.abs(mean_recon[i,1]-y[i,1]).cpu(), 'Abs Err (Imag)', cmap='magma')
                 plt.tight_layout()
@@ -723,7 +726,7 @@ def main():
 
         trainer = pl.Trainer(
             max_epochs=args.epochs,
-            accelerator="gpu",
+            accelerator="cpu",
             devices=1,
             log_every_n_steps=10,
             logger=logger,
@@ -756,7 +759,7 @@ def main():
     # --- Testing Phase ---
     print(f"--- Starting Test Phase on {ckpt_path} ---")
     # Load model from checkpoint for testing
-    model = LitUNet.load_from_checkpoint(ckpt_path)
+    model = LitUNet.load_from_checkpoint(ckpt_path, strict=False)
     
     test(model=model, test_loader=test_loader)
     print("--- Test Finished ---")
