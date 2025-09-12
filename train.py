@@ -64,17 +64,9 @@ class LitUNet(pl.LightningModule):
         self.criterion = torch.nn.MSELoss()
 
         # Register buffers. They will be populated from the checkpoint if loading.
-        if bkgs is None:
-            self.register_buffer('bkgs', torch.zeros(5, 2, 100, 100))
-        else:
-            self.register_buffer('bkgs', bkgs)
-
-        if bkg_sct_fields is None:
-            self.register_buffer('bkg_sct_fields', torch.zeros(5, 2, 24, 24))
-
-        else:
-            self.register_buffer('bkg_sct_fields', bkg_sct_fields)
-
+        self.register_buffer('bkgs', bkgs)
+        self.register_buffer('bkg_sct_fields', bkg_sct_fields)
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
     
@@ -758,8 +750,23 @@ def main():
 
     # --- Testing Phase ---
     print(f"--- Starting Test Phase on {ckpt_path} ---")
-    # Load model from checkpoint for testing
-    model = LitUNet.load_from_checkpoint(ckpt_path, strict=False)
+    
+    # First, load the checkpoint to inspect its contents
+    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    
+    # Extract background tensors from checkpoint
+    bkgs_from_ckpt = checkpoint['state_dict']['bkgs']
+    bkg_sct_fields_from_ckpt = checkpoint['state_dict']['bkg_sct_fields']
+        
+    # Load model from checkpoint with the background tensors
+    model = LitUNet.load_from_checkpoint(
+        ckpt_path, 
+        strict=False,
+        bkgs=bkgs_from_ckpt,
+        bkg_sct_fields=bkg_sct_fields_from_ckpt
+    )
+    
+    print(f"Successfully loaded model with {model.bkgs.shape[0]} backgrounds")
     
     test(model=model, test_loader=test_loader)
     print("--- Test Finished ---")
