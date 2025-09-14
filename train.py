@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 from Unet import UNet
 import main as data_main
 from MultiBkgDataset import MultiBkgDataset
+from Litmus_test import litmus_test
 
 
 class FieldsDataset(Dataset):
@@ -204,7 +205,35 @@ class LitUNet(pl.LightningModule):
         # (If desired later, can swap fg_grid_mu/fg_grid_deviation with weighted versions.)
 
         return fg_grid, weighted_mean, weighted_std
+    
+    def anomaly_test(self, fg_sct, bg_sct, bg_grid):
+        """Using the backgrounds, assess the quality of the contrast prediction around the bkgs return mse across all bkgs
+        fg_sct: (B,2,24,24)
+        bg_sct: (B,nbkgs,2,24,24)
+        bg_grid: (B,nbkgs,2,100,100)
+        returns mse: (B,nbkgs)
+        """
+        # start by getting all the bkgs masks well need
+        #bkg_masks = self.get_bkg_masks(bg_grid)  # (B,nbkgs,2,100,100)
+        B, nbkgs, _, H, W = bg_sct.shape
+        # generate the contrast predictions for this batch
+        fg_sct_expanded = fg_sct.unsqueeze(1).expand(-1, nbkgs, -1, -1, -1)  # (B,nbkgs,2,24,24)
+        contrast = fg_sct_expanded - bg_sct  # (B,nbkgs,2,24,24)
+        contrast_reshaped = contrast.view(B * nbkgs, 2, H, W)
+        pred_epsilon_grid = self.reconstruction(fg_sct, bg_sct, bg_grid)[1]  # (B,2,100,100)
+        pred_chi_grid = self(contrast_reshaped)  # (B*nbkgs,2,100,100)
+        pred_chi_grid = pred_chi_grid.view(B, nbkgs, 2, 100, 100)
 
+        pred_epsilon_complex = pred_epsilon_grid[:, 0] + 1j * pred_epsilon_grid[:, 1]
+        pred_epsilon_complex = pred_epsilon_complex.unsqueeze(1).expand(-1, nbkgs, -1, -1)  # (B,nbkgs,100,100)
+        pred_chi_complex = pred_chi_grid[:, :, 0] + 1j * pred_chi_grid[:, :, 1]
+        pred_bkg_complex = pred_epsilon_complex/(pred_chi_complex + 1) # (B,nbkgs,100,100)
+
+        # now compute the mse between the predicted bkg and the actual bkg across all bkgs
+        pred_bkg_grid = torch.stack([pred_bkg_complex.real, pred_bkg_complex.imag], dim=2)  # (B,nbkgs,2,100,100)
+        sq_diff = (pred_bkg_grid - bg_grid) ** 2
+        mse = torch.mean(sq_diff, dim=[2,3,4])  # (B,nbkgs)
+        return mse
 
     def training_step(self, batch, batch_idx: int):
         x, y, fg_grid, bg_grid, fg_sct_field, bg_sct_field = batch
@@ -578,6 +607,7 @@ def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers:
     synth_fields, cal_e_fields, grids, uncal_spars = load_data(file_path)
     synth_dataset = MultiBkgDataset(fields=synth_fields, grids=grids, n_backgrounds=25)
     exp_dataset = FieldsDataset(x_np=cal_e_fields, y_np=grids)
+    sparam_dataset = FieldsDataset(x_np=uncal_spars, y_np=grids)
     n_total = len(synth_dataset)
     n_val = max(1, int(n_total * val_split))
     n_train = n_total - n_val
@@ -587,7 +617,9 @@ def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers:
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     test_loader = DataLoader(exp_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    return train_loader, val_loader, test_loader
+    sparam_test_loader = DataLoader(sparam_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+
+    return train_loader, val_loader, test_loader, sparam_test_loader
 
 
 def test(
@@ -684,7 +716,7 @@ def main():
 
     args = parser.parse_args()
 
-    train_loader, val_loader, test_loader = build_loaders(
+    train_loader, val_loader, test_loader, sparam_test_loader = build_loaders(
         file_path=args.data,
         batch_size=args.batch_size,
         val_split=args.val_split,
@@ -721,7 +753,7 @@ def main():
 
         trainer = pl.Trainer(
             max_epochs=args.epochs,
-            accelerator="gpu",
+            accelerator="cpu",
             devices=1,
             log_every_n_steps=10,
             logger=logger,
@@ -771,7 +803,9 @@ def main():
     
     print(f"Successfully loaded model with {model.bkgs.shape[0]} backgrounds")
     
-    test(model=model, test_loader=test_loader)
+    #test(model=model, test_loader=test_loader)
+    litmus_test(model=model, in_range_test_loader=test_loader, out_of_range_test_loader=sparam_test_loader)
+
     print("--- Test Finished ---")
 
 
