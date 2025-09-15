@@ -31,6 +31,8 @@ def litmus_test(
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+    print(f"Running litmus test on device: {device}")
+
     model.to(device)
     model.eval()
     in_range_errors = []
@@ -50,7 +52,7 @@ def litmus_test(
             this_batch_size = inputs.shape[0]
             bg_grid = model.bkgs.unsqueeze(0).expand(this_batch_size, -1, -1, -1, -1)
             bg_sct = model.bkg_sct_fields.unsqueeze(0).expand(this_batch_size, -1, -1, -1, -1)
-            errors = model.anomaly_test(inputs, bg_sct, bg_grid)
+            errors = model.bkgs_mean_error(inputs, bg_sct, bg_grid)
             # anomaly_test may return shape [B, nbkgs]; flatten so we track all values
             in_range_errors.append(errors.flatten())
 
@@ -60,7 +62,7 @@ def litmus_test(
             this_batch_size = inputs.shape[0]
             bg_grid = model.bkgs.unsqueeze(0).expand(this_batch_size, -1, -1, -1, -1)
             bg_sct = model.bkg_sct_fields.unsqueeze(0).expand(this_batch_size, -1, -1, -1, -1)
-            errors = model.anomaly_test(inputs, bg_sct, bg_grid)
+            errors = model.bkgs_mean_error(inputs, bg_sct, bg_grid)
             # anomaly_test may return shape [B, nbkgs]; flatten so we track all values
             out_of_range_errors.append(errors.flatten())
 
@@ -68,14 +70,44 @@ def litmus_test(
     out_of_range_errors = torch.cat(out_of_range_errors).cpu().numpy()
     print(f"In-range errors: mean={np.mean(in_range_errors):.4f}, std={np.std(in_range_errors):.4f}")
     print(f"Out-of-range errors: mean={np.mean(out_of_range_errors):.4f}, std={np.std(out_of_range_errors):.4f}")
+
+    # Robust plotting: limit displayed range to 1st–99th percentiles to avoid outliers dominating the bins
+    combined = np.concatenate([in_range_errors, out_of_range_errors])
+    p_low, p_high = np.percentile(combined, [1, 99])
+    # Guard against degenerate ranges
+    if not np.isfinite(p_low) or not np.isfinite(p_high) or p_high <= p_low:
+        p_low = float(np.min(combined))
+        p_high = float(np.max(combined))
+        if p_high <= p_low:
+            p_high = p_low + 1e-6
+
+    n_clip_in = int(((in_range_errors < p_low) | (in_range_errors > p_high)).sum())
+    n_clip_out = int(((out_of_range_errors < p_low) | (out_of_range_errors > p_high)).sum())
+
     plt.figure(figsize=(10, 6))
-    plt.hist(in_range_errors, bins=30, alpha=0.5, label='In-Range', color='blue', density=True)
-    plt.hist(out_of_range_errors, bins=30, alpha=0.5, label='Out-of-Range', color='red', density=True)
+    plt.hist(
+        in_range_errors,
+        bins='fd',  # Freedman–Diaconis is robust to outliers
+        alpha=0.5,
+        label=f'In-Range (clipped {n_clip_in})',
+        color='blue',
+        density=True,
+        range=(p_low, p_high),
+    )
+    plt.hist(
+        out_of_range_errors,
+        bins='fd',
+        alpha=0.5,
+        label=f'Out-of-Range (clipped {n_clip_out})',
+        color='red',
+        density=True,
+        range=(p_low, p_high),
+    )
     plt.xlabel('Average Error Around Background')
-    plt.ylabel('Density')
-    plt.title('Litmus Test: In-Range vs Out-of-Range Errors')
+    plt.ylabel('Density (1–99% range)')
+    plt.title(f'Litmus Test: In-Range vs Out-of-Range Errors (showing 1–99% range)')
     plt.legend()
     plt.grid(True)
     plt.savefig(os.path.join(output_dir, 'litmus_test_histogram.png'))
     plt.close()
-    print(f"Litmus test histogram saved to {os.path.join(output_dir, 'litmus_test_histogram.png')}")
+    print(f"Litmus test histogram saved to {os.path.join(output_dir, 'litmus_test_histogram.png')} (clipped range: [{p_low:.3g}, {p_high:.3g}])")

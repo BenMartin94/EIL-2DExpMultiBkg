@@ -206,7 +206,7 @@ class LitUNet(pl.LightningModule):
 
         return fg_grid, weighted_mean, weighted_std
     
-    def anomaly_test(self, fg_sct, bg_sct, bg_grid):
+    def bkgs_mean_error(self, fg_sct, bg_sct, bg_grid):
         """Using the backgrounds, assess the quality of the contrast prediction around the bkgs return mse across all bkgs
         fg_sct: (B,2,24,24)
         bg_sct: (B,nbkgs,2,24,24)
@@ -214,7 +214,7 @@ class LitUNet(pl.LightningModule):
         returns mse: (B,nbkgs)
         """
         # start by getting all the bkgs masks well need
-        #bkg_masks = self.get_bkg_masks(bg_grid)  # (B,nbkgs,2,100,100)
+        bkg_masks = self.get_bkg_masks(bg_grid)  # (B,nbkgs,2,100,100)
         B, nbkgs, _, H, W = bg_sct.shape
         # generate the contrast predictions for this batch
         fg_sct_expanded = fg_sct.unsqueeze(1).expand(-1, nbkgs, -1, -1, -1)  # (B,nbkgs,2,24,24)
@@ -232,7 +232,12 @@ class LitUNet(pl.LightningModule):
         # now compute the mse between the predicted bkg and the actual bkg across all bkgs
         pred_bkg_grid = torch.stack([pred_bkg_complex.real, pred_bkg_complex.imag], dim=2)  # (B,nbkgs,2,100,100)
         sq_diff = (pred_bkg_grid - bg_grid) ** 2
-        mse = torch.mean(sq_diff, dim=[2,3,4])  # (B,nbkgs)
+        bkg_masks_inversed = 1.0 - bkg_masks  # (B,nbkgs,2,100,100); 1 where edges are
+        # Weighted mean over channel + spatial dims (per bkg)
+        num = (sq_diff * bkg_masks_inversed).sum(dim=(2, 3, 4))  # (B, nbkgs)
+        den = bkg_masks_inversed.sum(dim=(2, 3, 4)).clamp_min(1e-8)  # (B, nbkgs)
+        mse = num / den  # (B, nbkgs)
+        mse = torch.mean(mse, dim=1)  # (B,) average over bkgs
         return mse
 
     def training_step(self, batch, batch_idx: int):
