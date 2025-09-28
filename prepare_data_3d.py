@@ -1,6 +1,6 @@
 import numpy as np
 import h5py
-import keras
+import torchvision  # Replaces keras
 from skimage.transform import resize
 
 class Dataset:
@@ -37,7 +37,11 @@ def create_3d_mnist_data(target_file):
     target_indices = target_indices.astype(int)
     target_indices = target_indices - 1    # to align with indices used in julia
 
-    (x_train, _), (_, _) = keras.datasets.mnist.load_data()
+    # (x_train, _), (_, _) = keras.datasets.mnist.load_data()
+    # Load MNIST data using torchvision, ensuring it's downloaded to a local './data' directory
+    mnist_trainset = torchvision.datasets.MNIST(root='./data', train=True, download=True)
+    x_train = mnist_trainset.data.numpy()  # Convert tensor to numpy array
+
     targets = x_train[target_indices]
 
     ### change targets to 3d by expanding along one axis, and increase resolution
@@ -121,7 +125,7 @@ def process_multifreq_data(fields_file, targets_file, targetless_fields_file, nu
         field_data[target, :, :, :] = field_data[target, :, :, :] - targetless_field_data[0, :, :, :]
 
     # convert to single frequency data (1GHz) (take both real and im channels)
-    field_data = field_data[:, :, :, 2:4]
+    field_data = field_data[:, :, :, 14:16]
     num_freqs = 1
 
     # load targets
@@ -143,7 +147,7 @@ def process_multifreq_data(fields_file, targets_file, targetless_fields_file, nu
     if (trainset):
         data_mean = np.mean(field_data_train)
         data_std = np.std(field_data_train)
-        field_data_train = (field_data_train - data_mean)/ data_std
+        field_data_train = (field_data_train - data_mean) / (data_std+1e-6)
         train_data = Dataset(field_data_train, targets_train, num_targets, num_freqs, num_recvers, num_sources)
 
         return train_data

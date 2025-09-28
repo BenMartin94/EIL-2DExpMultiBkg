@@ -8,3 +8,4 @@ figures/
 *.pyc
 lightning_logs/
 3d_dataset/
+data/

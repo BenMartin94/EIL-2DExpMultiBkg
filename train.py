@@ -389,12 +389,17 @@ class LitUNet(pl.LightningModule):
             
         for i in range(n_examples):
             # Show real part of channel 0 for input, target, prediction
-            axes[i, 0].imshow(x[i, 0].cpu(), cmap="viridis")
+            im0 = axes[i, 0].imshow(x[i, 0].cpu(), cmap="viridis")
             axes[i, 0].set_title("Input (real)")
-            axes[i, 1].imshow(y[i, 0].cpu(), cmap="viridis")
+            plt.colorbar(im0, ax=axes[i, 0], fraction=0.046, pad=0.04)
+            
+            im1 = axes[i, 1].imshow(y[i, 0].cpu(), cmap="viridis")
             axes[i, 1].set_title("Target (real)")
-            axes[i, 2].imshow(y_hat[i, 0].detach().cpu(), cmap="viridis")
+            plt.colorbar(im1, ax=axes[i, 1], fraction=0.046, pad=0.04)
+            
+            im2 = axes[i, 2].imshow(y_hat[i, 0].detach().cpu(), cmap="viridis")
             axes[i, 2].set_title("Pred (real)")
+            plt.colorbar(im2, ax=axes[i, 2], fraction=0.046, pad=0.04)
             for j in range(3):
                 axes[i, j].axis("off")
         plt.tight_layout()

@@ -59,18 +59,18 @@ class UnetModel(nn.Module):
     def __init__(self, in_channels: int, image_dim: int, dropout_rate: float = 0.0, final_activation: str = 'linear'):
         super().__init__()
         self.image_dim = image_dim
+        starting_filters = 64
+        self.encode1 = EncoderBlock(in_channels, starting_filters, dropout_rate)
+        self.encode2 = EncoderBlock(starting_filters, starting_filters*2, dropout_rate)
 
-        self.encode1 = EncoderBlock(in_channels, 16, dropout_rate)
-        self.encode2 = EncoderBlock(16, 32, dropout_rate)
+        self.bottleneck1 = nn.Conv2d(starting_filters*2, starting_filters*4, kernel_size=5, padding=2)
+        self.bottleneck2 = nn.Conv2d(starting_filters*4, starting_filters*4, kernel_size=5, padding=2)
 
-        self.bottleneck1 = nn.Conv2d(32, 64, kernel_size=5, padding=2)
-        self.bottleneck2 = nn.Conv2d(64, 64, kernel_size=5, padding=2)
+        self.decode1 = DecoderBlock(starting_filters*4, starting_filters*2, dropout_rate)
+        self.decode2 = DecoderBlock(starting_filters*2, starting_filters, dropout_rate)
 
-        self.decode1 = DecoderBlock(64, 32, dropout_rate)
-        self.decode2 = DecoderBlock(32, 16, dropout_rate)
-
-        self.conv1 = nn.Conv2d(16, 16, kernel_size=5, padding=2)
-        self.conv2 = nn.Conv2d(16, self.image_dim // 2, kernel_size=1)
+        self.conv1 = nn.Conv2d(starting_filters, starting_filters, kernel_size=5, padding=2)
+        self.conv2 = nn.Conv2d(starting_filters, self.image_dim // 2, kernel_size=1)
         # This final conv layer creates image_dim channels, which will serve as the depth of the output volume
         self.conv3 = nn.Conv2d(self.image_dim // 2, self.image_dim, kernel_size=1)
         
