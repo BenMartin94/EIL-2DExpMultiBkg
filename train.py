@@ -163,7 +163,7 @@ class LitUNet(pl.LightningModule):
 
     
     
-    def reconstruction(self, fg_sct, bg_sct, bg_grid):
+    def reconstruction(self, fg_sct, bg_sct, bg_grid, filter_method='weighted'):
         """Reconstruct the full fg_grid from fg_sct-bg_sct and bg_grid
         by adding the background field back into the predicted contrast for each bg
 
@@ -192,19 +192,22 @@ class LitUNet(pl.LightningModule):
         # Unweighted stats (kept for backward compatibility)
         fg_grid_mu = fg_grid.mean(dim=1)  # (B,2,100,100)
         fg_grid_deviation = torch.std(fg_grid, dim=1)  # (B,2,100,100)
-
-        # Weighted stats (currently unused in return but computed with new batched masks)
-        weighted_sum = torch.sum(fg_grid * weights_for_mean, dim=1)  # (B,2,100,100)
-        weight_totals = torch.sum(weights_for_mean, dim=1)  # (B,2,100,100)
-        mask = weight_totals > 0
-        weighted_mean = torch.zeros_like(fg_grid_mu)
-        weighted_mean[mask] = weighted_sum[mask] / (weight_totals[mask] + 1e-8)
-        weighted_sq_sum = torch.sum((fg_grid - weighted_mean.unsqueeze(1)) ** 2 * weights_for_mean, dim=1)
-        weighted_var = weighted_sq_sum / (weight_totals + 1e-8)
-        weighted_std = torch.sqrt(weighted_var)
-        # (If desired later, can swap fg_grid_mu/fg_grid_deviation with weighted versions.)
-
-        return fg_grid, weighted_mean, weighted_std
+        if filter_method == 'none':
+            return fg_grid, fg_grid_mu, fg_grid_deviation
+        elif filter_method == 'weighted':
+            # Weighted stats (currently unused in return but computed with new batched masks)
+            weighted_sum = torch.sum(fg_grid * weights_for_mean, dim=1)  # (B,2,100,100)
+            weight_totals = torch.sum(weights_for_mean, dim=1)  # (B,2,100,100)
+            mask = weight_totals > 0
+            weighted_mean = torch.zeros_like(fg_grid_mu)
+            weighted_mean[mask] = weighted_sum[mask] / (weight_totals[mask] + 1e-8)
+            weighted_sq_sum = torch.sum((fg_grid - weighted_mean.unsqueeze(1)) ** 2 * weights_for_mean, dim=1)
+            weighted_var = weighted_sq_sum / (weight_totals + 1e-8)
+            weighted_std = torch.sqrt(weighted_var)
+            # (If desired later, can swap fg_grid_mu/fg_grid_deviation with weighted versions.)
+            return fg_grid, weighted_mean, weighted_std
+        else:
+            raise ValueError(f"Unknown filter_method: {filter_method}")
     
     def bkgs_mean_error(self, fg_sct, bg_sct, bg_grid):
         """Using the backgrounds, assess the quality of the contrast prediction around the bkgs return mse across all bkgs
@@ -405,7 +408,7 @@ class LitUNet(pl.LightningModule):
         plt.tight_layout()
         fig_dir = f"figures/epoch_{self.current_epoch}"
         os.makedirs(fig_dir, exist_ok=True)
-        fig_path = os.path.join(fig_dir, "val_examples.png")
+        fig_path = os.path.join(fig_dir, "val_examples.pdf")
         plt.savefig(fig_path)
         plt.close(fig)
 
@@ -535,7 +538,7 @@ class LitUNet(pl.LightningModule):
             plt.tight_layout()
             fig_dir = f"figures/epoch_{self.current_epoch}"
             os.makedirs(fig_dir, exist_ok=True)
-            fig_path = os.path.join(fig_dir, "reconstruction_examples.png")
+            fig_path = os.path.join(fig_dir, "reconstruction_examples.pdf")
             plt.savefig(fig_path)
             plt.close(fig)
             
@@ -626,8 +629,25 @@ def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers:
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    test_loader = DataLoader(exp_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    sparam_test_loader = DataLoader(sparam_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    # Deterministic shuffling for test loaders by using explicit generators
+    test_gen = torch.Generator().manual_seed(seed + 100)
+    sparam_gen = torch.Generator().manual_seed(seed + 200)
+    test_loader = DataLoader(
+        exp_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        generator=test_gen,
+    )
+    sparam_test_loader = DataLoader(
+        sparam_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        generator=sparam_gen,
+    )
 
     return train_loader, val_loader, test_loader, sparam_test_loader
 
@@ -674,33 +694,76 @@ def test(
             assert nbkgs > 0, "Model has no backgrounds stored for reconstruction."
             bg_grid = model.bkgs.unsqueeze(0).expand(take, -1, -1, -1, -1)          # (take,nbkgs,2,100,100)
             bg_sct = model.bkg_sct_fields.unsqueeze(0).expand(take, -1, -1, -1, -1)  # (take,nbkgs,2,24,24)
-
             per_bkg_recons, mean_recon, std_recon = model.reconstruction(x, bg_sct, bg_grid)
+
+
+            scts = x.unsqueeze(1).expand(-1, nbkgs, -1, -1, -1) - bg_sct  # (take,nbkgs,2,24,24)
+            contrasts_pred = model(scts.view(take * nbkgs, 2, 24, 24))  # (take*nbkgs,2,100,100)
+            contrasts_pred = contrasts_pred.view(take, nbkgs, 2, 100, 100)
+            y_complex = y[:,0] + 1j * y[:,1]
+            y_complex = y_complex.unsqueeze(1).expand(-1, nbkgs, -1, -1)  # (take,nbkgs,100,100)
+            bg_complex = bg_grid[:,:,0] + 1j * bg_grid[:,:,1]
+            contrasts_gt_complex = (y_complex - bg_complex) / bg_complex
+            contrasts_gt = torch.stack([contrasts_gt_complex.real, contrasts_gt_complex.imag], dim=2)  # (take,nbkgs,2,100,100)
+
+            # Plot 4x1 real-channel contrast (prediction / ground-truth / abs error) for first sample
+
+            sample_idx = collected  # global sample index for this first example in the current batch
+            real_pred = contrasts_pred[0, 0, 0].cpu()  # (100,100)
+            real_gt = contrasts_gt[0, 0, 0].cpu()      # (100,100)
+            real_err = torch.abs(real_pred - real_gt)
+            real_eps_pred = per_bkg_recons[0,0,0].cpu()
+            real_eps_gt = y[0,0].cpu()
+            real_eps_err = torch.abs(real_eps_pred - real_eps_gt)
+
+            fig, axes = plt.subplots(4, 1, figsize=(4, 12))
+            def show(ax, tensor2d, title, cmap='viridis'):
+                im = ax.imshow(tensor2d, cmap=cmap)
+                ax.set_title(title, fontsize=9)
+                ax.axis('off')  # Remove axis ticks and lines
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+            show(axes[0], real_pred, 'Pred Contrast (Real)')
+            show(axes[1], real_eps_pred, 'Pred Target (Real)')
+            show(axes[2], real_eps_gt, 'GT Target (Real)')
+            show(axes[3], real_eps_err, 'Abs Error (Real)')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f"sample_{sample_idx}_contrasts_real.pdf"), dpi=150)
+            plt.close(fig)
+
+
+            #####################################################################
+            # Demonstrate effect of weighted filtering on the reconstructions in a 2x2 plot
+            #####################################################################
+            # Unfiltered
+
+
             mae = torch.mean(torch.abs(mean_recon - y)).item()
             mse = torch.mean((mean_recon - y) ** 2).item()
             print(f"Samples {collected}-{collected+take} MAE={mae:.4e} MSE={mse:.4e}")
 
             for i in range(take):
                 idx_global = collected + i
-                fig, axes = plt.subplots(2, 5, figsize=(18, 6))
-                fig.suptitle(f"Test Sample {idx_global}")
+                # Updated: 2x4 layout (remove first background visualization)
+                fig, axes = plt.subplots(2, 4, figsize=(14, 6))
                 def show(ax, tensor2d, title, cmap='viridis'):
                     im = ax.imshow(tensor2d, cmap=cmap)
                     ax.set_title(title, fontsize=9)
                     ax.axis('off')
                     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                # Row 0 (Real): GT | Mean | Std | Abs Err
                 show(axes[0,0], y[i,0].cpu(), 'GT (Real)')
                 show(axes[0,1], mean_recon[i,0].cpu(), 'Mean Recon (Real)')
-                show(axes[0,2], bg_grid[i,0,0].cpu(), 'First BG (Real)')
+                show(axes[0,2], std_recon[i,0].cpu(), 'Std (Real)', cmap='plasma')
+                show(axes[0,3], torch.abs(mean_recon[i,0]-y[i,0]).cpu(), 'Abs Err (Real)', cmap='magma')
+                # Row 1 (Imag): GT | Mean | Std | Abs Err
                 show(axes[1,0], y[i,1].cpu(), 'GT (Imag)')
                 show(axes[1,1], mean_recon[i,1].cpu(), 'Mean Recon (Imag)')
-                show(axes[1,2], bg_grid[i,0,1].cpu(), 'First BG (Imag)')
-                show(axes[0,3], std_recon[i,0].cpu(), 'Std (Real)', cmap='plasma')
-                show(axes[0,4], torch.abs(mean_recon[i,0]-y[i,0]).cpu(), 'Abs Err (Real)', cmap='magma')
-                show(axes[1,3], std_recon[i,1].cpu(), 'Std (Imag)', cmap='plasma')
-                show(axes[1,4], torch.abs(mean_recon[i,1]-y[i,1]).cpu(), 'Abs Err (Imag)', cmap='magma')
+                show(axes[1,2], std_recon[i,1].cpu(), 'Std (Imag)', cmap='plasma')
+                show(axes[1,3], torch.abs(mean_recon[i,1]-y[i,1]).cpu(), 'Abs Err (Imag)', cmap='magma')
                 plt.tight_layout()
-                plt.savefig(os.path.join(output_dir, f"sample_{idx_global}.png"), dpi=150)
+                plt.savefig(os.path.join(output_dir, f"sample_{idx_global}.pdf"), dpi=150)
                 plt.close(fig)
             collected += take
             if collected >= num_cases:
@@ -813,8 +876,8 @@ def main():
     
     print(f"Successfully loaded model with {model.bkgs.shape[0]} backgrounds")
     
-    #test(model=model, test_loader=test_loader)
-    litmus_test(model=model, in_range_test_loader=test_loader, out_of_range_test_loader=sparam_test_loader)
+    test(model=model, test_loader=test_loader)
+    #litmus_test(model=model, in_range_test_loader=test_loader, out_of_range_test_loader=sparam_test_loader)
 
     print("--- Test Finished ---")
 

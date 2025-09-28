@@ -137,7 +137,7 @@ class Lit3D(pl.LightningModule):
                 plt.tight_layout()
                 fig_dir = f"figures/epoch_{self.current_epoch}"
                 os.makedirs(fig_dir, exist_ok=True)
-                fig_path = os.path.join(fig_dir, f"val_step_{batch_idx}_slices.png")
+                fig_path = os.path.join(fig_dir, f"val_step_{batch_idx}_slices.pdf")
                 plt.savefig(fig_path, dpi=150)
                 plt.close(fig)
                     # No counters; plotted only for batch_idx==0
@@ -432,7 +432,7 @@ def main():
         # Define output directory and save plot
         out_dir = os.path.join("figures", "remote_view")
         os.makedirs(out_dir, exist_ok=True)
-        output_path = os.path.join(out_dir, "validation_slices.png")
+        output_path = os.path.join(out_dir, "validation_slices.pdf")
 
         save_orthogonal_slices(y_true, y_pred, y_std, output_path)
 
