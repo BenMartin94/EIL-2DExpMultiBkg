@@ -57,12 +57,14 @@ class LitUNet(pl.LightningModule):
         out_channels: int = 2,
         base_channels: int = 64,
         lr: float = 1e-3,
+        experiment_tag: str = "experiment",
     ):
         super().__init__()
         # Save hyperparameters, ignoring large tensors.
         self.save_hyperparameters(ignore=['bkgs', 'bkg_sct_fields'])
         self.model = UNet(in_channels=in_channels, out_channels=out_channels, base_channels=base_channels)
         self.criterion = torch.nn.MSELoss()
+        self.experiment_tag = experiment_tag
 
         # Register buffers. They will be populated from the checkpoint if loading.
         self.register_buffer('bkgs', bkgs)
@@ -188,6 +190,10 @@ class LitUNet(pl.LightningModule):
         bg_grid_complex = bg_grid[:, :, 0] + 1j * bg_grid[:, :, 1]
         fg_grid_complex = pred_contrast_complex * bg_grid_complex + bg_grid_complex
         fg_grid = torch.stack([fg_grid_complex.real, fg_grid_complex.imag], dim=2)  # (B,nbkgs,2,100,100)
+
+        if nbkgs == 1:
+            # If only one background, no need to compute weighted stats
+            return fg_grid, fg_grid[:, 0], torch.zeros_like(fg_grid[:, 0])
 
         # Unweighted stats (kept for backward compatibility)
         fg_grid_mu = fg_grid.mean(dim=1)  # (B,2,100,100)
@@ -406,7 +412,7 @@ class LitUNet(pl.LightningModule):
             for j in range(3):
                 axes[i, j].axis("off")
         plt.tight_layout()
-        fig_dir = f"figures/epoch_{self.current_epoch}"
+        fig_dir = f"figures/{self.experiment_tag}/epoch_{self.current_epoch}"
         os.makedirs(fig_dir, exist_ok=True)
         fig_path = os.path.join(fig_dir, "val_examples.pdf")
         plt.savefig(fig_path)
@@ -536,7 +542,7 @@ class LitUNet(pl.LightningModule):
                     axes[i, j].axis("off")
                     
             plt.tight_layout()
-            fig_dir = f"figures/epoch_{self.current_epoch}"
+            fig_dir = f"figures/{self.experiment_tag}/epoch_{self.current_epoch}"
             os.makedirs(fig_dir, exist_ok=True)
             fig_path = os.path.join(fig_dir, "reconstruction_examples.pdf")
             plt.savefig(fig_path)
@@ -616,9 +622,9 @@ def load_data(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
     return synth_fields, cal_e_fields, grids, uncal_spars
 
 
-def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers: int, seed: int):
+def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers: int, seed: int, num_backgrounds: int = 25):
     synth_fields, cal_e_fields, grids, uncal_spars = load_data(file_path)
-    synth_dataset = MultiBkgDataset(fields=synth_fields, grids=grids, n_backgrounds=25)
+    synth_dataset = MultiBkgDataset(fields=synth_fields, grids=grids, n_backgrounds=num_backgrounds)
     exp_dataset = FieldsDataset(x_np=cal_e_fields, y_np=grids)
     sparam_dataset = FieldsDataset(x_np=uncal_spars, y_np=grids)
     n_total = len(synth_dataset)
@@ -770,6 +776,89 @@ def test(
                 break
     print(f"Saved {collected} test reconstruction figures to {output_dir}")
 
+def generate_calibration_curve(model: LitUNet,
+    test_loader,
+    num_cases: int = 100,
+    output_dir: str = "figures/test",
+    device: str | None = None
+    ):
+    from uncertainty_cal_eval import calibration_curve
+    os.makedirs(output_dir, exist_ok=True)
+
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    model.to(device)
+    model.eval()
+
+    nbkgs = getattr(model, 'bkgs', None)
+    if nbkgs is None:
+        raise RuntimeError("Model has no stored backgrounds for calibration curve generation.")
+    nbkgs_count = model.bkgs.shape[0]
+    assert nbkgs_count > 0, "Model has no backgrounds stored for reconstruction."
+
+    means = []
+    stds = []
+    targets = []
+
+    remaining = float('inf') if num_cases is None else max(int(num_cases), 0)
+
+    with torch.no_grad():
+        for batch in test_loader:
+            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                x, y = batch[:2]
+            else:
+                raise RuntimeError("Expected (x,y) batch from test_loader")
+
+            if remaining <= 0:
+                break
+
+            B = x.shape[0]
+            take = B if remaining == float('inf') else min(B, remaining)
+            x = x.to(device)[:take]
+            y = y.to(device)[:take]
+
+            bg_grid = model.bkgs.unsqueeze(0).expand(take, -1, -1, -1, -1)
+            bg_sct = model.bkg_sct_fields.unsqueeze(0).expand(take, -1, -1, -1, -1)
+            _, mean_recon, std_recon = model.reconstruction(x, bg_sct, bg_grid)
+
+            means.append(mean_recon.cpu().numpy())
+            stds.append(std_recon.cpu().numpy())
+            targets.append(y.cpu().numpy())
+
+            if remaining != float('inf'):
+                remaining -= take
+
+    if not means:
+        raise RuntimeError("No samples were processed for calibration curve generation.")
+    mean_arr = np.concatenate(means, axis=0)
+    std_arr = np.concatenate(stds, axis=0)
+    target_arr = np.concatenate(targets, axis=0)
+
+    print(mean_arr.shape, std_arr.shape, target_arr.shape)
+
+    expected_conf, observed_conf = calibration_curve(mean_arr, std_arr, target_arr)
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.plot(expected_conf, observed_conf, label='Observed')
+    ax.plot([0, 1], [0, 1], linestyle='--', color='gray', label='Ideal')
+    ax.set_xlabel('Expected confidence')
+    ax.set_ylabel('Observed coverage')
+    ax.set_title('Calibration Curve')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    output_path = os.path.join(output_dir, 'calibration_curve.pdf')
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    print(f"Calibration curve saved to {output_path}")
+
+    return expected_conf, observed_conf
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train UNet to map synth fields (24x24x2) -> grids (100x100x2)")
     parser.add_argument("--data", type=str, default="all_data.mat", help="Path to .mat file")
@@ -784,10 +873,12 @@ def main():
     parser.add_argument("--debug-recon", action="store_true", help="Run a single debug reconstruction before training")
     parser.add_argument("--test-only", action="store_true", help="Skip training and run test on a checkpoint.")
     parser.add_argument("--ckpt-path", type=str, default=None, help="Path to checkpoint for testing. If None, finds latest.")
-
-    EXPERIMENT_TAG = "mbg_train_synth_test_cal_exp_25bkgs"
+    parser.add_argument("--experiment-tag", type=str, default="mbg_train_synth_test_cal_exp_25bkgs", help="Tag for experiment (used in logging)")
+    parser.add_argument("--num-backgrounds", type=int, default=25, help="Number of backgrounds to use from training dataset")
 
     args = parser.parse_args()
+    
+    EXPERIMENT_TAG = args.experiment_tag
 
     train_loader, val_loader, test_loader, sparam_test_loader = build_loaders(
         file_path=args.data,
@@ -795,6 +886,7 @@ def main():
         val_split=args.val_split,
         num_workers=args.num_workers,
         seed=args.seed,
+        num_backgrounds=args.num_backgrounds,
     )
 
     if not args.test_only:
@@ -811,7 +903,8 @@ def main():
             in_channels=2,
             out_channels=2,
             base_channels=args.base_channels,
-            lr=args.lr
+            lr=args.lr,
+            experiment_tag=EXPERIMENT_TAG
         )
 
         logger = TensorBoardLogger(save_dir="lightning_logs", name=EXPERIMENT_TAG)
@@ -826,7 +919,7 @@ def main():
 
         trainer = pl.Trainer(
             max_epochs=args.epochs,
-            accelerator="cpu",
+            accelerator="cuda",
             devices=1,
             log_every_n_steps=10,
             logger=logger,
@@ -871,13 +964,18 @@ def main():
         ckpt_path, 
         strict=False,
         bkgs=bkgs_from_ckpt,
-        bkg_sct_fields=bkg_sct_fields_from_ckpt
+        bkg_sct_fields=bkg_sct_fields_from_ckpt,
+        experiment_tag=EXPERIMENT_TAG
     )
     
+    # print summary of the model
+    
+
     print(f"Successfully loaded model with {model.bkgs.shape[0]} backgrounds")
     
     test(model=model, test_loader=test_loader)
-    #litmus_test(model=model, in_range_test_loader=test_loader, out_of_range_test_loader=sparam_test_loader)
+    # generate_calibration_curve(model=model, test_loader=test_loader, output_dir="figures/test")
+    # litmus_test(model=model, in_range_test_loader=test_loader, out_of_range_test_loader=sparam_test_loader)
 
     print("--- Test Finished ---")
 
