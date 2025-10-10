@@ -206,6 +206,9 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = UNet().to(device)
 
+    # print the model summary
+    print(model)
+
     # channels-first input
     x = torch.randn(4, 2, 24, 24, device=device)
     y = model(x)

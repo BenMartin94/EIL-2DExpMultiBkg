@@ -128,6 +128,12 @@ def process_multifreq_data(fields_file, targets_file, targetless_fields_file, nu
     field_data = field_data[:, :, :, 14:16]
     num_freqs = 1
 
+    print("Field data shape: ", field_data.shape)  # (num_targets, num_sources, num_recvers, 2*num_freqs)
+
+    # num_sources = 24 and recvers = 72. Make it square by duplicating sources 3x
+    field_data = np.concatenate((field_data, field_data, field_data), axis=1)
+    num_sources = num_sources * 3
+
     # load targets
     ### for providing physical targets (not just target info)
     # with h5py.File(targets_file, 'r') as target_data:

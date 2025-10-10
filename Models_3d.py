@@ -106,6 +106,25 @@ class UnetModel(nn.Module):
 
         return x
 
+class SimpleUNet(nn.Module):
+    """
+    A simple U-Net model without transformer blocks.
+    Takes a 2D input tensor and produces a 3D volumetric output.
+    """
+    def __init__(self, in_channels: int = 2, image_dim: int = 56, dropout_rate: float = 0.0):
+        super().__init__()
+        self.unet = UnetModel(in_channels=in_channels, image_dim=image_dim, dropout_rate=dropout_rate)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Input x is expected to have shape (batch_size, in_channels, height, width)
+        # e.g., (batch, 2, 72, 72)
+        
+        # Pass directly through U-Net to get the final 3D volume
+        # Output shape: (batch, image_dim, image_dim, image_dim) e.g. (batch, 56, 56, 56)
+        x = self.unet(x)
+        
+        return x
+
 class TransformerUNet(nn.Module):
     """
     The main model, combining a Transformer encoder with the U-Net decoder.
@@ -139,18 +158,23 @@ class TransformerUNet(nn.Module):
         self.unet = UnetModel(in_channels=unet_in_channels, image_dim=image_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Input x is expected to have shape (batch_size, seq_len, embed_dim)
-        # e.g., (batch, 20, 576)
+        # Input x is expected to have shape (batch_size, channels, spatial_dim)
+        # e.g., (batch, 2, 5184) for batch_first transformer
+        
+        B, C, spatial_dim = x.shape
 
         # 1. Pass through Transformer layers
         for layer in self.transformer_layers:
             x = layer(x)
 
         # 2. Reshape for the U-Net
-        # The Keras code reshapes and transposes. The equivalent here is a single view operation
-        # to get the shape (batch_size, channels, height, width) for the PyTorch U-Net.
-        # (batch, 20, 576) -> (batch, 20, 24, 24)
-        x = x.view(-1, 2 * self.num_freqs, self.num_receivers, self.num_sources)
+        # Need to convert (B, C, spatial_dim) back to (B, C, H, W)
+        # where H = W = sqrt(spatial_dim) and C = 2*num_freqs
+        import math
+        H = W = int(math.sqrt(spatial_dim))
+        assert H * W == spatial_dim, f"spatial_dim {spatial_dim} must be a perfect square"
+        
+        x = x.view(B, C, H, W)  # e.g., (B, 2, 72, 72)
 
         # 3. Pass through U-Net to get the final 3D volume
         # Output shape: (batch, image_dim, image_dim, image_dim) e.g. (batch, 56, 56, 56)
@@ -168,7 +192,31 @@ if __name__ == '__main__':
     NUM_FREQS = 10
     IMAGE_DIM = 56 # The dimension of the output cube (56x56x56)
 
-    # --- Instantiate the model ---
+    print("=" * 60)
+    print("Testing SimpleUNet")
+    print("=" * 60)
+    
+    # --- Test SimpleUNet ---
+    simple_unet = SimpleUNet(in_channels=2, image_dim=IMAGE_DIM)
+    
+    # Create dummy input (B, 2, 72, 72)
+    simple_input = torch.randn(BATCH_SIZE, 2, 72, 72)
+    print(f"Input shape:  {simple_input.shape}")
+    
+    # Forward pass
+    simple_output = simple_unet(simple_input)
+    print(f"Output shape: {simple_output.shape}")
+    print(f"Expected shape: ({BATCH_SIZE}, {IMAGE_DIM}, {IMAGE_DIM}, {IMAGE_DIM})")
+    
+    # Check if the output shape is correct
+    assert simple_output.shape == (BATCH_SIZE, IMAGE_DIM, IMAGE_DIM, IMAGE_DIM)
+    print("SimpleUNet test passed! ✓\n")
+    
+    print("=" * 60)
+    print("Testing TransformerUNet")
+    print("=" * 60)
+    
+    # --- Instantiate the TransformerUNet model ---
     model = TransformerUNet(
         num_transformer_layers=NUM_TRANSFORMER_LAYERS,
         num_heads=NUM_HEADS,
@@ -195,12 +243,22 @@ if __name__ == '__main__':
 
     # --- Check if the output shape is correct ---
     assert output.shape == (BATCH_SIZE, IMAGE_DIM, IMAGE_DIM, IMAGE_DIM)
-    print("\nModel instantiated and tested successfully!")
+    print("TransformerUNet test passed! ✓\n")
 
     # --- Print model summary ---
     try:
         from torchinfo import summary
+        print("=" * 60)
+        print("SimpleUNet Summary")
+        print("=" * 60)
+        summary(simple_unet, input_size=(BATCH_SIZE, 2, 72, 72))
+        print("\n" + "=" * 60)
+        print("TransformerUNet Summary")
+        print("=" * 60)
         summary(model, input_size=dummy_input.shape)
     except ImportError:
         print("\nInstall 'torchinfo' (pip install torchinfo) for a detailed model summary.")
+        print("\nSimpleUNet:")
+        print(simple_unet)
+        print("\nTransformerUNet:")
         print(model)

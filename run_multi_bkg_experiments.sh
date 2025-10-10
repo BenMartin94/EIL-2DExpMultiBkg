@@ -7,7 +7,8 @@ set -e  # Exit on any error
 
 # Configuration
 DATA_FILE="all_data.mat"
-EPOCHS=50
+EPOCHS=100
+STEPS_PER_EPOCH=9000
 BATCH_SIZE=8
 LR=5e-4
 BASE_CHANNELS=64
@@ -16,8 +17,8 @@ NUM_WORKERS=2
 SEED=42
 
 # Array of background counts to test
-BKG_COUNTS=(1 5 25 50)
-
+BKG_COUNTS=(50)
+#BKG_COUNTS=(50)
 # Base experiment name
 BASE_EXP_NAME="mbg_train_synth_test_cal_exp"
 
@@ -52,7 +53,8 @@ for NUM_BKGS in "${BKG_COUNTS[@]}"; do
         --num-workers $NUM_WORKERS \
         --seed $SEED \
         --num-backgrounds $NUM_BKGS \
-        --experiment-tag "$EXP_TAG"
+        --experiment-tag "$EXP_TAG" \
+        --steps-per-epoch $STEPS_PER_EPOCH
     
     echo ""
     echo "Completed experiment: $EXP_TAG"

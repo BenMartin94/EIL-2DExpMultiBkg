@@ -15,8 +15,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from MultiBkgDataset_3d import Fields3DMultiBkgDataset
 
 from Models_3d import TransformerUNet
-
-
+from rendering import render_volume
 
 
 # --- Minimal LightningModule for 3D training ---
@@ -30,6 +29,7 @@ class Lit3D(pl.LightningModule):
         lr: float = 1e-3,
         num_transformer_layers: int = 1,
         num_heads: int = 16,
+        dropout_rate: float = 0.0,
         bkgs: torch.Tensor | None = None,            # (n_bgs,1,D,H,W)
         bkg_sct_fields: torch.Tensor | None = None,  # (n_bgs,2F,R,S)
     ):
@@ -50,10 +50,11 @@ class Lit3D(pl.LightningModule):
     # Validation plotting strategy: plot only on first val batch per epoch
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 2F, R, S) -> (B, 2F, R*S)
-        B, C, R, S = x.shape
-        x_seq = x.view(B, C, R * S)
-        return self.model(x_seq)  # (B, D, H, W) with D=H=W=image_dim
+        # x: (B, 2F, R, S) = (B, 2, 72, 72)
+        # TransformerUNet expects (B, C, H*W) where C=2*num_freqs, H*W=R*S
+        B, C, H, W = x.shape
+        x_flat = x.view(B, C, H * W)  # (B, 2, 5184)
+        return self.model(x_flat)  # (B, D, H, W) with D=H=W=image_dim
 
     def training_step(self, batch, batch_idx: int):
         x, y, fg_vol, bg_vol, fg_sct, bg_sct = batch
@@ -140,6 +141,66 @@ class Lit3D(pl.LightningModule):
                 fig_path = os.path.join(fig_dir, f"val_step_{batch_idx}_slices.pdf")
                 plt.savefig(fig_path, dpi=150)
                 plt.close(fig)
+                
+                # --- Render 3D volumes using vedo ---
+                try:
+                    # Render ground truth
+                    render_volume(
+                        volume=gt,
+                        output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_gt_render.png"),
+                        camera_position=(100, 100, 100),
+                        focal_point=(D//2, H//2, W//2),
+                        image_size=(800, 800),
+                        colormap="turbo",
+                        alpha=[0, 0.1, 0.3, 0.6, 1.0],
+                        show_axes=True,
+                        background="white",
+                        zoom=1.2
+                    )
+                    
+                    # Render prediction
+                    render_volume(
+                        volume=pred,
+                        output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_pred_render.png"),
+                        camera_position=(100, 100, 100),
+                        focal_point=(D//2, H//2, W//2),
+                        image_size=(800, 800),
+                        colormap="turbo",
+                        alpha=[0, 0.1, 0.3, 0.6, 1.0],
+                        show_axes=True,
+                        background="white",
+                        zoom=1.2
+                    )
+                    
+                    # Render uncertainty (std)
+                    render_volume(
+                        volume=sd,
+                        output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_std_render.png"),
+                        camera_position=(100, 100, 100),
+                        focal_point=(D//2, H//2, W//2),
+                        image_size=(800, 800),
+                        colormap="plasma",
+                        alpha=[0, 0.2, 0.4, 0.7, 1.0],
+                        show_axes=True,
+                        background="white",
+                        zoom=1.2
+                    )
+                    
+                    # Render absolute difference
+                    render_volume(
+                        volume=absdiff,
+                        output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_diff_render.png"),
+                        camera_position=(100, 100, 100),
+                        focal_point=(D//2, H//2, W//2),
+                        image_size=(800, 800),
+                        colormap="magma",
+                        alpha=[0, 0.2, 0.4, 0.7, 1.0],
+                        show_axes=True,
+                        background="white",
+                        zoom=1.2
+                    )
+                except Exception as e:
+                    print(f"[WARN] Volume rendering failed: {e}")
                     # No counters; plotted only for batch_idx==0
             
         return val_loss
@@ -280,11 +341,11 @@ def save_orthogonal_slices(target_vol: np.ndarray, pred_vol: np.ndarray, std_vol
 
 def main():
     parser = argparse.ArgumentParser(description="Train minimal 3D TransformerUNet with Lightning")
-    parser.add_argument("--fields-file", type=str, default="./3d_dataset/field_data_with2000Target.mat", help="Path to fields .h5 file")
+    parser.add_argument("--fields-file", type=str, default="./3d_dataset/field_data_with2000Target_72Rx.mat", help="Path to fields .h5 file")
     parser.add_argument("--targets-file", type=str, default="./3d_dataset/targets_data_with2000Target.mat", help="Path to targets .h5 file")
-    parser.add_argument("--targetless-fields-file", type=str, default="./3d_dataset/background_field_data.mat", help="Path to targetless fields .h5 file")
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--targetless-fields-file", type=str, default="./3d_dataset/targetless_fielddata_72Rx.mat", help="Path to targetless fields .h5 file")
+    parser.add_argument("--epochs", type=int, default=35)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--val-split", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -292,9 +353,10 @@ def main():
     parser.add_argument("--num-transformer-layers", type=int, default=1)
     parser.add_argument("--num-heads", type=int, default=16)
     parser.add_argument("--fast-dev-run", action="store_true")
-    parser.add_argument("--n-backgrounds", type=int, default=100)
+    parser.add_argument("--n-backgrounds", type=int, default=25)
     parser.add_argument("--test-only", action="store_true", help="Skip training and load the latest/best checkpoint")
     parser.add_argument("--ckpt-path", type=str, default=None, help="Path to checkpoint. If None, finds latest.")
+    parser.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path to checkpoint to resume training from. Restores model, epoch, step, LR schedulers, etc.")
 
     args = parser.parse_args()
 
@@ -347,6 +409,7 @@ def main():
             lr=args.lr,
             num_transformer_layers=args.num_transformer_layers,
             num_heads=args.num_heads,
+            dropout_rate=0.0,
             bkgs=bg_vols,
             bkg_sct_fields=bg_fields,
         )
@@ -363,7 +426,11 @@ def main():
         )
 
         print("--- Starting 3D Training (MultiBkg) ---")
-        trainer.fit(model, train_loader, val_loader)
+        if args.resume_from_checkpoint:
+            print(f"Resuming training from checkpoint: {args.resume_from_checkpoint}")
+            trainer.fit(model, train_loader, val_loader, ckpt_path=args.resume_from_checkpoint)
+        else:
+            trainer.fit(model, train_loader, val_loader)
         print("--- 3D Training Finished ---")
 
         ckpt_path = checkpoint_callback.best_model_path
@@ -435,6 +502,69 @@ def main():
         output_path = os.path.join(out_dir, "validation_slices.pdf")
 
         save_orthogonal_slices(y_true, y_pred, y_std, output_path)
+        
+        # --- Render 3D volumes using vedo ---
+        print("\n--- Rendering 3D volumes ---")
+        try:
+            # Render ground truth
+            render_volume(
+                volume=y_true,
+                output_path=os.path.join(out_dir, "validation_gt_render.png"),
+                camera_position=(10, 10, 100),
+                focal_point=(np.array(y_true.shape) / 2.0),
+                image_size=(800, 800),
+                colormap="turbo",
+                alpha=[0, 0.1, 0.3, 0.6, 1.0],
+                show_axes=True,
+                background="white",
+                zoom=1.2
+            )
+            
+            # Render prediction
+            render_volume(
+                volume=y_pred,
+                output_path=os.path.join(out_dir, "validation_pred_render.png"),
+                camera_position=(10, 10, 100),
+                focal_point=(np.array(y_pred.shape) / 2.0),
+                image_size=(800, 800),
+                colormap="turbo",
+                alpha=[0, 0.1, 0.3, 0.6, 1.0],
+                show_axes=True,
+                background="white",
+                zoom=1.2
+            )
+            
+            # Render uncertainty (std)
+            render_volume(
+                volume=y_std,
+                output_path=os.path.join(out_dir, "validation_std_render.png"),
+                camera_position=(10, 10, 100),
+                focal_point=(np.array(y_std.shape) / 2.0),
+                image_size=(800, 800),
+                colormap="plasma",
+                alpha=[0, 0.2, 0.4, 0.7, 1.0],
+                show_axes=True,
+                background="white",
+                zoom=1.2
+            )
+            
+            # Render absolute difference
+            y_diff = np.abs(y_true - y_pred)
+            render_volume(
+                volume=y_diff,
+                output_path=os.path.join(out_dir, "validation_diff_render.png"),
+                camera_position=(10, 10, 100),
+                focal_point=(np.array(y_diff.shape) / 2.0),
+                image_size=(800, 800),
+                colormap="magma",
+                alpha=[0, 0.2, 0.4, 0.7, 1.0],
+                show_axes=True,
+                background="white",
+                zoom=1.2
+            )
+            print("Volume rendering completed successfully!")
+        except Exception as e:
+            print(f"[WARN] Volume rendering failed: {e}")
 
     except StopIteration:
         print("\n[ERROR] Plotting failed: The validation dataloader is empty.")

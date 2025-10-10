@@ -308,10 +308,6 @@ class LitUNet(pl.LightningModule):
             self._log_images_to_tensorboard(x, y, y_hat)
             self._log_reconstruction_images(fg_grid, all_bg_grids, fg_sct_field, all_bg_fields)
             
-        # Log weight histograms every 10 epochs
-        if batch_idx == 0 and (self.current_epoch + 1) % 10 == 0:
-            self._log_weight_histograms()
-            
         return val_loss
         
     
@@ -622,7 +618,7 @@ def load_data(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
     return synth_fields, cal_e_fields, grids, uncal_spars
 
 
-def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers: int, seed: int, num_backgrounds: int = 25):
+def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers: int, seed: int, num_backgrounds: int = 25, steps_per_epoch: int = None):
     synth_fields, cal_e_fields, grids, uncal_spars = load_data(file_path)
     synth_dataset = MultiBkgDataset(fields=synth_fields, grids=grids, n_backgrounds=num_backgrounds)
     exp_dataset = FieldsDataset(x_np=cal_e_fields, y_np=grids)
@@ -633,8 +629,17 @@ def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers:
     g = torch.Generator().manual_seed(seed)
     train_ds, val_ds = random_split(synth_dataset, [n_train, n_val], generator=g)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    # If steps_per_epoch is specified, create a custom sampler that repeats/limits data
+    if steps_per_epoch is not None:
+        num_samples = steps_per_epoch * batch_size
+        # Create a sampler that will provide exactly num_samples samples per epoch
+        from torch.utils.data import RandomSampler
+        train_sampler = RandomSampler(train_ds, replacement=True, num_samples=num_samples, generator=torch.Generator().manual_seed(seed))
+        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=train_sampler, num_workers=num_workers, pin_memory=True)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    
+    val_loader = DataLoader(val_ds, batch_size=batch_size//2, shuffle=False, num_workers=num_workers, pin_memory=True)
     # Deterministic shuffling for test loaders by using explicit generators
     test_gen = torch.Generator().manual_seed(seed + 100)
     sparam_gen = torch.Generator().manual_seed(seed + 200)
@@ -875,10 +880,12 @@ def main():
     parser.add_argument("--ckpt-path", type=str, default=None, help="Path to checkpoint for testing. If None, finds latest.")
     parser.add_argument("--experiment-tag", type=str, default="mbg_train_synth_test_cal_exp_25bkgs", help="Tag for experiment (used in logging)")
     parser.add_argument("--num-backgrounds", type=int, default=25, help="Number of backgrounds to use from training dataset")
+    parser.add_argument("--steps-per-epoch", type=int, default=None, help="Number of training steps per epoch. If None, uses full dataset. Data will be reused if this exceeds dataset size.")
 
     args = parser.parse_args()
     
     EXPERIMENT_TAG = args.experiment_tag
+    print(f"Steps per epoch: {args.steps_per_epoch}")
 
     train_loader, val_loader, test_loader, sparam_test_loader = build_loaders(
         file_path=args.data,
@@ -887,6 +894,7 @@ def main():
         num_workers=args.num_workers,
         seed=args.seed,
         num_backgrounds=args.num_backgrounds,
+        steps_per_epoch=args.steps_per_epoch,
     )
 
     if not args.test_only:
@@ -973,7 +981,7 @@ def main():
 
     print(f"Successfully loaded model with {model.bkgs.shape[0]} backgrounds")
     
-    test(model=model, test_loader=test_loader)
+    #test(model=model, test_loader=test_loader)
     # generate_calibration_curve(model=model, test_loader=test_loader, output_dir="figures/test")
     # litmus_test(model=model, in_range_test_loader=test_loader, out_of_range_test_loader=sparam_test_loader)
 

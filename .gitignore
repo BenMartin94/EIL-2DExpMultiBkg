@@ -9,3 +9,4 @@ figures/
 lightning_logs/
 3d_dataset/
 data/
+3d_dataset*
