@@ -148,7 +148,7 @@ class Lit3D(pl.LightningModule):
                     render_volume(
                         volume=gt,
                         output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_gt_render.png"),
-                        camera_position=(100, 100, 100),
+                        camera_position=(10, 10, 100),
                         focal_point=(D//2, H//2, W//2),
                         image_size=(800, 800),
                         colormap="turbo",
@@ -162,11 +162,12 @@ class Lit3D(pl.LightningModule):
                     render_volume(
                         volume=pred,
                         output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_pred_render.png"),
-                        camera_position=(100, 100, 100),
+                        camera_position=(10, 10, 100),
                         focal_point=(D//2, H//2, W//2),
                         image_size=(800, 800),
                         colormap="turbo",
                         alpha=[0, 0.1, 0.3, 0.6, 1.0],
+                        threshold=1.1,
                         show_axes=True,
                         background="white",
                         zoom=1.2
@@ -176,7 +177,7 @@ class Lit3D(pl.LightningModule):
                     render_volume(
                         volume=sd,
                         output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_std_render.png"),
-                        camera_position=(100, 100, 100),
+                        camera_position=(10, 10, 100),
                         focal_point=(D//2, H//2, W//2),
                         image_size=(800, 800),
                         colormap="plasma",
@@ -190,7 +191,7 @@ class Lit3D(pl.LightningModule):
                     render_volume(
                         volume=absdiff,
                         output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_diff_render.png"),
-                        camera_position=(100, 100, 100),
+                        camera_position=(10, 10, 100),
                         focal_point=(D//2, H//2, W//2),
                         image_size=(800, 800),
                         colormap="magma",

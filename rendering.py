@@ -18,7 +18,7 @@ def render_volume(
     alpha: Optional[Union[List[float], str]] = None,
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
-    threshold: Optional[float] = 1.1,
+    threshold: Optional[float] = 0,
     threshold_mode: str = "below",
     show_axes: bool = False,
     show_colorbar: bool = True,
