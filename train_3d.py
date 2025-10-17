@@ -148,21 +148,18 @@ class Lit3D(pl.LightningModule):
                     render_volume(
                         volume=gt,
                         output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_gt_render.png"),
-                        camera_position=(10, 10, 100),
                         focal_point=(D//2, H//2, W//2),
                         image_size=(800, 800),
                         colormap="turbo",
                         alpha=[0, 0.1, 0.3, 0.6, 1.0],
                         show_axes=True,
                         background="white",
-                        zoom=1.2
                     )
                     
                     # Render prediction
                     render_volume(
                         volume=pred,
                         output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_pred_render.png"),
-                        camera_position=(10, 10, 100),
                         focal_point=(D//2, H//2, W//2),
                         image_size=(800, 800),
                         colormap="turbo",
@@ -170,35 +167,31 @@ class Lit3D(pl.LightningModule):
                         threshold=1.1,
                         show_axes=True,
                         background="white",
-                        zoom=1.2
+                        vmin=1.0,
                     )
                     
                     # Render uncertainty (std)
                     render_volume(
                         volume=sd,
                         output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_std_render.png"),
-                        camera_position=(10, 10, 100),
                         focal_point=(D//2, H//2, W//2),
                         image_size=(800, 800),
                         colormap="plasma",
                         alpha=[0, 0.2, 0.4, 0.7, 1.0],
                         show_axes=True,
-                        background="white",
-                        zoom=1.2
+                        background="white"
                     )
                     
                     # Render absolute difference
                     render_volume(
                         volume=absdiff,
                         output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_diff_render.png"),
-                        camera_position=(10, 10, 100),
                         focal_point=(D//2, H//2, W//2),
                         image_size=(800, 800),
                         colormap="magma",
                         alpha=[0, 0.2, 0.4, 0.7, 1.0],
                         show_axes=True,
-                        background="white",
-                        zoom=1.2
+                        background="white"
                     )
                 except Exception as e:
                     print(f"[WARN] Volume rendering failed: {e}")
@@ -511,42 +504,37 @@ def main():
             render_volume(
                 volume=y_true,
                 output_path=os.path.join(out_dir, "validation_gt_render.png"),
-                camera_position=(10, 10, 100),
                 focal_point=(np.array(y_true.shape) / 2.0),
                 image_size=(800, 800),
                 colormap="turbo",
                 alpha=[0, 0.1, 0.3, 0.6, 1.0],
                 show_axes=True,
                 background="white",
-                zoom=1.2
             )
             
             # Render prediction
             render_volume(
                 volume=y_pred,
                 output_path=os.path.join(out_dir, "validation_pred_render.png"),
-                camera_position=(10, 10, 100),
                 focal_point=(np.array(y_pred.shape) / 2.0),
                 image_size=(800, 800),
                 colormap="turbo",
                 alpha=[0, 0.1, 0.3, 0.6, 1.0],
                 show_axes=True,
                 background="white",
-                zoom=1.2
+                vmin=1.0,
             )
             
             # Render uncertainty (std)
             render_volume(
                 volume=y_std,
                 output_path=os.path.join(out_dir, "validation_std_render.png"),
-                camera_position=(10, 10, 100),
                 focal_point=(np.array(y_std.shape) / 2.0),
                 image_size=(800, 800),
                 colormap="plasma",
                 alpha=[0, 0.2, 0.4, 0.7, 1.0],
                 show_axes=True,
-                background="white",
-                zoom=1.2
+                background="white"
             )
             
             # Render absolute difference
@@ -554,7 +542,6 @@ def main():
             render_volume(
                 volume=y_diff,
                 output_path=os.path.join(out_dir, "validation_diff_render.png"),
-                camera_position=(10, 10, 100),
                 focal_point=(np.array(y_diff.shape) / 2.0),
                 image_size=(800, 800),
                 colormap="magma",

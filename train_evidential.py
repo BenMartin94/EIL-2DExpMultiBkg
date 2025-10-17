@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 
 from evidential import EvidentialUnet, evidential_NLL, reg_loss_1, reg_loss_2
 from data_loader import load_data, FieldsDataset
+from uncertainty_cal_eval import error_std_correlation
 
 
 class LitEvidentialUNet(pl.LightningModule):
@@ -208,6 +209,8 @@ class LitEvidentialUNet(pl.LightningModule):
             # Log uncertainty statistics (with numerical stability)
             epistemic_unc = beta / (alpha - 1 + 1e-10)
             aleatoric_unc = beta / (v * (alpha - 1) + 1e-10)
+
+            var = (beta/(alpha-1))*(1+v)/v
             
             self.log("val_epistemic_unc", torch.mean(epistemic_unc), on_step=False, on_epoch=True)
             self.log("val_aleatoric_unc", torch.mean(aleatoric_unc), on_step=False, on_epoch=True)
@@ -406,6 +409,14 @@ def test(
     model.eval()
 
     collected = 0
+    
+    # Lists to collect all predictions for correlation analysis
+    all_predictions = []
+    all_targets = []
+    all_epistemic = []
+    all_aleatoric = []
+    all_total_unc = []
+    
     with torch.no_grad():
         for batch in test_loader:
             x, y = batch
@@ -423,6 +434,13 @@ def test(
             epistemic_unc = beta / (alpha - 1)
             aleatoric_unc = beta / (v * (alpha - 1))
             total_unc = epistemic_unc + aleatoric_unc
+            
+            # Collect for correlation analysis
+            all_predictions.append(gamma.cpu().numpy())
+            all_targets.append(y.cpu().numpy())
+            all_epistemic.append(epistemic_unc.cpu().numpy())
+            all_aleatoric.append(aleatoric_unc.cpu().numpy())
+            all_total_unc.append(total_unc.cpu().numpy())
 
             # Compute metrics
             mae = torch.mean(torch.abs(gamma - y)).item()
@@ -464,6 +482,34 @@ def test(
             collected += take
             if collected >= num_cases:
                 break
+    
+    # Compute correlation coefficients
+    all_predictions = np.concatenate(all_predictions, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+    all_epistemic = np.concatenate(all_epistemic, axis=0)
+    all_aleatoric = np.concatenate(all_aleatoric, axis=0)
+    all_total_unc = np.concatenate(all_total_unc, axis=0)
+    
+    print("\n" + "="*60)
+    print("UNCERTAINTY CORRELATION ANALYSIS")
+    print("="*60)
+    
+    # Epistemic uncertainty correlation
+    corr_epistemic, p_epistemic = error_std_correlation(all_predictions, all_epistemic, all_targets)
+    print(f"Epistemic Uncertainty Correlation: {corr_epistemic:.4f} (p={p_epistemic:.4e})")
+    
+    # Aleatoric uncertainty correlation
+    corr_aleatoric, p_aleatoric = error_std_correlation(all_predictions, all_aleatoric, all_targets)
+    print(f"Aleatoric Uncertainty Correlation: {corr_aleatoric:.4f} (p={p_aleatoric:.4e})")
+    
+    # Total uncertainty correlation
+    corr_total, p_total = error_std_correlation(all_predictions, all_total_unc, all_targets)
+    print(f"Total Uncertainty Correlation:     {corr_total:.4f} (p={p_total:.4e})")
+    
+    print("="*60)
+    print(f"Interpretation: Values close to +1 indicate good uncertainty estimates.")
+    print(f"High correlation means high uncertainty corresponds to high error.")
+    print("="*60 + "\n")
                 
     print(f"Saved {collected} test figures to {output_dir}")
 
@@ -475,7 +521,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--base-channels", type=int, default=64)
-    parser.add_argument("--reg-coef-1", type=float, default=1, help="Regularization coefficient for reg_loss_1")
+    parser.add_argument("--reg-coef-1", type=float, default=0.1, help="Regularization coefficient for reg_loss_1")
     parser.add_argument("--reg-coef-2", type=float, default=0.01, help="Regularization coefficient for reg_loss_2")
     parser.add_argument("--mse-coef", type=float, default=0.0, help="MSE loss coefficient (always included in training)")
     parser.add_argument("--val-split", type=float, default=0.05)

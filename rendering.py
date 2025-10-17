@@ -1,167 +1,110 @@
 import numpy as np
-from typing import Tuple, Optional, Union, List
-from vedo import Volume, Plotter, settings, addons
-
-
-# Configure vedo for offscreen rendering
-settings.default_backend = "vtk"
-settings.use_depth_peeling = True
+import pyvista as pv
 
 
 def render_volume(
     volume: np.ndarray,
     output_path: str = "volume_render.png",
-    camera_position: Optional[Union[Tuple, List, np.ndarray]] = None,
-    focal_point: Optional[Union[Tuple, List, np.ndarray]] = None,
-    image_size: Tuple[int, int] = (800, 800),
-    colormap: str = "turbo",
-    alpha: Optional[Union[List[float], str]] = None,
-    vmin: Optional[float] = None,
-    vmax: Optional[float] = None,
-    threshold: Optional[float] = 0,
-    threshold_mode: str = "below",
+    cmap: str = "coolwarm",
+    vmin: float = None,
+    vmax: float = None,
+    camera_position: tuple = (-50, 50, 175),
+    focal_point: tuple = None,
+    image_size: tuple = (800, 800),
+    colormap: str = None,  # Alias for cmap
+    alpha: list = None,  # Opacity values
     show_axes: bool = False,
-    show_colorbar: bool = True,
     background: str = "white",
-    zoom: float = 1.0
+    zoom: float = 1.0,
 ) -> np.ndarray:
     """
-    Render a 3D voxel volume using vedo and save as PNG.
+    Render a 3D voxel volume using PyVista headless and save as PNG.
     
     Parameters:
     -----------
     volume : np.ndarray
         3D array representing the voxel data.
-        Shape: (depth, height, width) or any (D, H, W) configuration.
     output_path : str
         Path to save the rendered PNG image.
-    camera_position : tuple/list/array, optional
-        3D position of the camera [x, y, z].
-        If None, vedo will choose automatically.
-    focal_point : tuple/list/array, optional
-        3D point the camera looks at [x, y, z].
-        If None, looks at the center of the volume.
-    image_size : Tuple[int, int]
-        Output image dimensions (width, height).
-    colormap : str
-        Colormap name (e.g., "turbo", "viridis", "jet", "bone").
-    alpha : list of floats or str, optional
-        Opacity values. Can be:
-        - List of 5 values [0-1] for low to high density
-        - "auto" for automatic opacity
-        - None for default [0, 0.1, 0.3, 0.6, 1.0]
+    cmap : str
+        Colormap name (default: "coolwarm").
     vmin : float, optional
-        Minimum value for colormap normalization.
+        Minimum value for colormap scaling. If None, uses data minimum.
     vmax : float, optional
-        Maximum value for colormap normalization.
-    threshold : float, optional
-        Threshold value for hiding voxels. If provided, voxels will be
-        hidden based on threshold_mode.
-    threshold_mode : str
-        How to apply threshold:
-        - "below": hide voxels below threshold (default)
-        - "above": hide voxels above threshold
+        Maximum value for colormap scaling. If None, uses data maximum.
+    camera_position : tuple, optional
+        Camera position (x, y, z). If None, uses default view.
+    focal_point : tuple, optional
+        Point the camera looks at (x, y, z). If None, uses volume center.
+    image_size : tuple
+        Output image size (width, height). Default: (800, 800).
+    colormap : str, optional
+        Alias for cmap parameter (for backward compatibility).
+    alpha : list, optional
+        Opacity transfer function values (5 values from 0-1).
+        If None, uses PyVista's default opacity.
     show_axes : bool
-        Whether to show coordinate axes.
-    show_colorbar : bool
-        Whether to show a colorbar for the volume.
+        Whether to show coordinate axes. Default: False.
     background : str
-        Background color (e.g., "white", "black", "gray").
+        Background color. Default: "white".
     zoom : float
-        Zoom factor (larger = closer).
+        Camera zoom factor. Default: 1.0.
     
     Returns:
     --------
     np.ndarray
-        Rendered image as numpy array (height, width, 3 or 4).
+        Rendered image as numpy array.
     
     Example:
     --------
     >>> volume = np.random.rand(64, 64, 64)
-    >>> render_volume(
-    ...     volume, 
-    ...     output_path="result.png",
-    ...     camera_position=(100, 100, 100),
-    ...     focal_point=(32, 32, 32)
-    ... )
+    >>> render_volume(volume, "output.png", vmin=0.2, vmax=0.8)
     """
+    # Handle colormap alias
+    if colormap is not None:
+        cmap = colormap
     
-    # Default alpha values if not provided
-    if alpha is None:
-        alpha = [0, 0.1, 0.3, 0.6, 1.0]
-    elif alpha == "auto":
-        alpha = "auto"
+    # Create PyVista ImageData from numpy array
+    grid = pv.ImageData(dimensions=volume.shape)
+    grid["scalars"] = volume.flatten(order="F")
     
-    # Apply thresholding if requested
-    volume_processed = volume.copy()
-    if threshold is not None:
-        if threshold_mode == "below":
-            volume_processed[volume_processed < threshold] = 0
-        elif threshold_mode == "above":
-            volume_processed[volume_processed > threshold] = 0
-        else:
-            raise ValueError(f"Invalid threshold_mode: {threshold_mode}. Use 'below' or 'above'.")
+    # Determine clim for colormap
+    if vmin is None:
+        vmin = volume.min()
+    if vmax is None:
+        vmax = volume.max()
     
-    # Create vedo Volume object
-    vol = Volume(volume_processed)
+    # Create plotter for headless rendering
+    pl = pv.Plotter(off_screen=True, window_size=image_size)
+    pl.set_background(background)
     
-    # Apply colormap and alpha
-    vol.cmap(colormap, vmin=vmin, vmax=vmax)
-    if isinstance(alpha, list):
-        vol.alpha(alpha)
+    # Add volume with optional opacity
+    if alpha is not None:
+        _ = pl.add_volume(grid, cmap=cmap, clim=[vmin, vmax], opacity=alpha)
+    else:
+        _ = pl.add_volume(grid, cmap=cmap, clim=[vmin, vmax])
     
-    # Create plotter for offscreen rendering
-    plt = Plotter(offscreen=True, size=image_size, bg=background)
-    plt.add(vol)
-    
-    # Add colorbar if requested
-    if show_colorbar:
-        # Create scalar bar with explicit label configuration
-        sb = addons.ScalarBar(
-            vol,
-            title="",
-            nlabels=5,
-            c='black' if background == 'white' else 'white',  # Contrast with background
-            horizontal=False,
-        )
-        plt.add(sb)
-    
-    # Set up camera if provided
+    # Set camera position if provided
     if camera_position is not None:
-        cam_pos = np.array(camera_position)
-        
         if focal_point is None:
-            # Default focal point is the center of the volume
-            focal_point = np.array(volume.shape) / 2.0
-        else:
-            focal_point = np.array(focal_point)
-        
-        plt.camera.SetPosition(cam_pos)
-        plt.camera.SetFocalPoint(focal_point)
-        plt.camera.SetViewUp(0, 0, 1)  # Z-up by default
+            # Default to volume center
+            focal_point = tuple(np.array(volume.shape) / 2.0)
+        pl.camera_position = [camera_position, focal_point, (0, 0, 1)]
     
     # Apply zoom
     if zoom != 1.0:
-        plt.camera.Zoom(zoom)
+        pl.camera.zoom(zoom)
     
     # Show axes if requested
     if show_axes:
-        plt.show(axes=1)
+        pl.show_axes()
     
-    # Render and save
-    plt.show()
-    plt.screenshot(output_path)
-    
-    # Read back the screenshot as numpy array
-    from PIL import Image
-    img = Image.open(output_path)
-    screenshot = np.array(img)
+    # Render and save to PNG
+    pl.show(screenshot=output_path)
     
     print(f"Saved rendered volume to {output_path}")
     
-    plt.close()
-    
-    return screenshot
+    return pl.screenshot(output_path, return_img=True)
 
 
 # --- Example usage ---
@@ -181,20 +124,17 @@ if __name__ == "__main__":
     
     print(f"Volume stats: min={volume.min():.3f}, max={volume.max():.3f}, mean={volume.mean():.3f}")
     
-    # Render from different angles using vedo
+    # Render using PyVista with all the extra arguments
     render_volume(
         volume=volume,
         output_path="sphere_render.png",
-        camera_position=(10, 10, 100),
-        focal_point=(32, 32, 32),
+        camera_position=(10, 10, 150),
+        focal_point=(size//2, size//2, size//2),
         image_size=(800, 800),
         colormap="turbo",
-        alpha="auto",
-        threshold=0.3,  # Hide voxels below 0.3
-        threshold_mode="below",
+        #alpha=[0, 0.1, 0.3, 0.6, 1.0],
         show_axes=True,
-        show_colorbar=True,
-        background="black",
+        background="white",
         zoom=1
     )
     

@@ -18,6 +18,7 @@ from Unet import UNet
 from MultiBkgDataset import MultiBkgDataset
 from Litmus_test import litmus_test
 from data_loader import load_data, FieldsDataset
+from uncertainty_cal_eval import error_std_correlation
 
 
 class LitUNet(pl.LightningModule):
@@ -644,6 +645,12 @@ def test(
     model.eval()
 
     collected = 0
+    
+    # Lists to collect all predictions for correlation analysis
+    all_mean_recons = []
+    all_targets = []
+    all_std_recons = []
+    
     with torch.no_grad():
         for batch in test_loader:
             # FieldsDataset returns (x,y)
@@ -663,6 +670,11 @@ def test(
             bg_grid = model.bkgs.unsqueeze(0).expand(take, -1, -1, -1, -1)          # (take,nbkgs,2,100,100)
             bg_sct = model.bkg_sct_fields.unsqueeze(0).expand(take, -1, -1, -1, -1)  # (take,nbkgs,2,24,24)
             per_bkg_recons, mean_recon, std_recon = model.reconstruction(x, bg_sct, bg_grid)
+
+            # Collect for correlation analysis
+            all_mean_recons.append(mean_recon.cpu().numpy())
+            all_targets.append(y.cpu().numpy())
+            all_std_recons.append(std_recon.cpu().numpy())
 
 
             scts = x.unsqueeze(1).expand(-1, nbkgs, -1, -1, -1) - bg_sct  # (take,nbkgs,2,24,24)
@@ -736,6 +748,26 @@ def test(
             collected += take
             if collected >= num_cases:
                 break
+    
+    # Compute correlation coefficients
+    all_mean_recons = np.concatenate(all_mean_recons, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+    all_std_recons = np.concatenate(all_std_recons, axis=0)
+    
+    print("\n" + "="*60)
+    print("UNCERTAINTY CORRELATION ANALYSIS")
+    print("="*60)
+    
+    
+    # Compute correlation between prediction error and uncertainty
+    correlation, p_value = error_std_correlation(all_mean_recons, all_std_recons, all_targets)
+    print(f"Uncertainty-Error Correlation: {correlation:.4f} (p={p_value:.4e})")
+    
+    print("="*60)
+    print(f"Interpretation: Values close to +1 indicate good uncertainty estimates.")
+    print(f"High correlation means high uncertainty corresponds to high error.")
+    print("="*60 + "\n")
+    
     print(f"Saved {collected} test reconstruction figures to {output_dir}")
 
 def generate_calibration_curve(model: LitUNet,
@@ -938,7 +970,7 @@ def main():
 
     print(f"Successfully loaded model with {model.bkgs.shape[0]} backgrounds")
     
-    #test(model=model, test_loader=test_loader)
+    test(model=model, test_loader=test_loader)
     # generate_calibration_curve(model=model, test_loader=test_loader, output_dir="figures/test")
     # litmus_test(model=model, in_range_test_loader=test_loader, out_of_range_test_loader=sparam_test_loader)
 
