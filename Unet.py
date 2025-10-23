@@ -6,6 +6,20 @@ import torch.nn.functional as F
 from typing import Tuple
 
 
+def bayesian_loss(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    """
+    Torch implementation of the bayesian_loss function
+    """
+
+    y_true = y_true.float()
+    mu = y_pred[:, :2, :, :]    # Image part of the prediction
+    log_var = y_pred[:, 2:, :, :]  # Uncertainty part of the prediction
+
+    loss = 0.5 * torch.exp(-log_var) * (y_true - mu)**2 + 0.5 * log_var
+    return torch.mean(loss)
+    #return torch.mean((y_true - y_img) ** 2)
+
+
 class DoubleConv(nn.Module):
     """(conv => BN => ReLU) * 2, preserving HxW (padding=1)."""
 
@@ -13,9 +27,11 @@ class DoubleConv(nn.Module):
         super().__init__()
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            #nn.Dropout(0.1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Dropout(0.05),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         )

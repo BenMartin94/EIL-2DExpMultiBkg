@@ -14,7 +14,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 import matplotlib.pyplot as plt
 
-from Unet import UNet
+from Unet import UNet, bayesian_loss
 import main as data_main
 from MultiBkgDataset import MultiBkgDataset
 from Litmus_test import litmus_test
@@ -63,7 +63,8 @@ class LitUNet(pl.LightningModule):
         # Save hyperparameters, ignoring large tensors.
         self.save_hyperparameters(ignore=['bkgs', 'bkg_sct_fields'])
         self.model = UNet(in_channels=in_channels, out_channels=out_channels, base_channels=base_channels)
-        self.criterion = torch.nn.MSELoss()
+        self.criterion = bayesian_loss
+        #self.criterion = torch.nn.MSELoss()
         self.experiment_tag = experiment_tag
 
         # Register buffers. They will be populated from the checkpoint if loading.
@@ -183,17 +184,18 @@ class LitUNet(pl.LightningModule):
         contrast = fg_sct_expanded - bg_sct  # (B,nbkgs,2,24,24)
         contrast_reshaped = contrast.view(B * nbkgs, 2, H, W)
         pred_contrast_grid = self(contrast_reshaped)  # (B*nbkgs,2,100,100)
-        pred_contrast_grid = pred_contrast_grid.view(B, nbkgs, 2, 100, 100)
+        pred_contrast_grid = pred_contrast_grid.view(B, nbkgs, 4, 100, 100)
 
         # Complex reconstruction
         pred_contrast_complex = pred_contrast_grid[:, :, 0] + 1j * pred_contrast_grid[:, :, 1]
         bg_grid_complex = bg_grid[:, :, 0] + 1j * bg_grid[:, :, 1]
         fg_grid_complex = pred_contrast_complex * bg_grid_complex + bg_grid_complex
         fg_grid = torch.stack([fg_grid_complex.real, fg_grid_complex.imag], dim=2)  # (B,nbkgs,2,100,100)
+        pred_vars = pred_contrast_grid[:, :, 2:]  # (B,nbkgs,2,100,100) currently unused
 
         if nbkgs == 1:
             # If only one background, no need to compute weighted stats
-            return fg_grid, fg_grid[:, 0], torch.zeros_like(fg_grid[:, 0])
+            return fg_grid, fg_grid[:, 0], pred_vars[:, 0]
 
         # Unweighted stats (kept for backward compatibility)
         fg_grid_mu = fg_grid.mean(dim=1)  # (B,2,100,100)
@@ -215,6 +217,12 @@ class LitUNet(pl.LightningModule):
         else:
             raise ValueError(f"Unknown filter_method: {filter_method}")
     
+    def enable_dropout(self):
+        """Function to enable the dropout layers during test-time"""
+        for m in self.modules():
+            if m.__class__.__name__.startswith('Dropout'):
+                m.train()
+
     def bkgs_mean_error(self, fg_sct, bg_sct, bg_grid):
         """Using the backgrounds, assess the quality of the contrast prediction around the bkgs return mse across all bkgs
         fg_sct: (B,2,24,24)
@@ -231,7 +239,7 @@ class LitUNet(pl.LightningModule):
         contrast_reshaped = contrast.view(B * nbkgs, 2, H, W)
         pred_epsilon_grid = self.reconstruction(fg_sct, bg_sct, bg_grid)[1]  # (B,2,100,100)
         pred_chi_grid = self(contrast_reshaped)  # (B*nbkgs,2,100,100)
-        pred_chi_grid = pred_chi_grid.view(B, nbkgs, 2, 100, 100)
+        pred_chi_grid = pred_chi_grid.view(B, nbkgs, 4, 100, 100)
 
         pred_epsilon_complex = pred_epsilon_grid[:, 0] + 1j * pred_epsilon_grid[:, 1]
         pred_epsilon_complex = pred_epsilon_complex.unsqueeze(1).expand(-1, nbkgs, -1, -1)  # (B,nbkgs,100,100)
@@ -273,7 +281,7 @@ class LitUNet(pl.LightningModule):
                 self.log("grad_norm", total_norm, on_step=True)
                 
                 # Log model statistics
-                mae = torch.mean(torch.abs(y_hat - y))
+                mae = torch.mean(torch.abs(y_hat[:,:2,:,:] - y))
                 self.log("train_mae", mae, on_step=True)
                 
         return loss
@@ -293,8 +301,8 @@ class LitUNet(pl.LightningModule):
         
         # Additional validation metrics
         with torch.no_grad():
-            mae = torch.mean(torch.abs(y_hat - y))
-            mse = torch.mean((y_hat - y) ** 2)
+            mae = torch.mean(torch.abs(y_hat[:,:2,:,:] - y))
+            mse = torch.mean((y_hat[:,:2,:,:] - y) ** 2)
             self.log("val_mae", mae, on_step=False, on_epoch=True)
             self.log("val_mse", mse, on_step=False, on_epoch=True)
             
@@ -781,6 +789,138 @@ def test(
                 break
     print(f"Saved {collected} test reconstruction figures to {output_dir}")
 
+
+def test_bcnn(
+    model: LitUNet,
+    test_loader,
+    num_cases: int = 10,
+    output_dir: str = "figures/test",
+    device: str | None = None,
+):
+    """Run reconstruction on a handful of test samples using backgrounds stored in the model.
+
+    Args:
+        model: Trained LitUNet instance with internal backgrounds (bkgs & bkg_sct_fields buffers).
+        test_loader: DataLoader providing experimental (x,y) pairs (x: (B,2,24,24), y: (B,2,100,100)).
+        num_cases: Number of individual samples to visualize.
+        output_dir: Directory to save figures.
+        device: Optional device override.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    model.to(device)
+    model.eval()
+    model.enable_dropout()
+
+    collected = 0
+    with torch.no_grad():
+        for batch in test_loader:
+            # FieldsDataset returns (x,y)
+            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                x, y = batch[:2]
+            else:
+                raise RuntimeError("Expected (x,y) batch from test_loader")
+            B = x.shape[0]
+            take = min(B, num_cases - collected)
+            if take <= 0:
+                break
+            x = x.to(device)[:take]
+            y = y.to(device)[:take]
+
+            nbkgs = model.bkgs.shape[0]
+            assert nbkgs > 0, "Model has no backgrounds stored for reconstruction."
+            assert nbkgs < 2, "Warning: Number of backgrounds > 1, did you call the wrong function?"
+            bg_grid = model.bkgs.unsqueeze(0).expand(take, -1, -1, -1, -1)          # (take,nbkgs,2,100,100)
+            bg_sct = model.bkg_sct_fields.unsqueeze(0).expand(take, -1, -1, -1, -1)  # (take,nbkgs,2,24,24)
+            
+            scts = x.unsqueeze(1).expand(-1, nbkgs, -1, -1, -1) - bg_sct  # (take,nbkgs,2,24,24)
+            MC_count = (5)
+            contrasts_pred_K = torch.zeros((MC_count, take, nbkgs, 4, 100, 100), dtype=torch.float32)
+            old_contrasts_pred_K = torch.zeros((MC_count, take, nbkgs, 4, 100, 100), dtype=torch.float32)
+            for k in range(MC_count):
+                per_bkg_recons, mean_recon, std_recon = model.reconstruction(x, bg_sct, bg_grid)
+                contrasts_pred = model(scts.view(take, 2, 24, 24))  # (take*nbkgs,2,100,100)
+                contrasts_pred = contrasts_pred.view(take, 1, 4, 100, 100)
+                old_contrasts_pred_K[k,...] = contrasts_pred.cpu()
+                contrasts_pred_K[k,:,:,:2,...] = mean_recon.view(take, 1, 2, 100, 100).cpu()
+                contrasts_pred_K[k,:,:,2:,...] = std_recon.view(take, 1, 2, 100, 100).cpu()
+
+            mean_contrasts_pred = torch.mean(contrasts_pred_K.squeeze(), axis=0)
+            std_contrasts_pred = torch.std(contrasts_pred_K.squeeze(), axis=0)
+
+            y_complex = y[:,0] + 1j * y[:,1]
+            y_complex = y_complex.unsqueeze(1).expand(-1, 1, -1, -1)  # (take,nbkgs,100,100)
+            bg_complex = bg_grid[:,:,0] + 1j * bg_grid[:,:,1]
+            contrasts_gt_complex = (y_complex - bg_complex) / bg_complex
+            contrasts_gt = torch.stack([contrasts_gt_complex.real, contrasts_gt_complex.imag], dim=2)  # (take,nbkgs,4,100,100)
+
+            # Plot 4x1 real-channel contrast (prediction / ground-truth / abs error) for first sample
+
+            sample_idx = collected  # global sample index for this first example in the current batch
+            real_pred = contrasts_pred[0, 0, 0].cpu()  # (100,100)
+            real_gt = contrasts_gt[0, 0, 0].cpu()      # (100,100)
+            real_err = torch.abs(real_pred - real_gt)
+            real_eps_pred = per_bkg_recons[0,0,0].cpu()
+            real_eps_gt = y[0,0].cpu()
+            real_eps_err = torch.abs(real_eps_pred - real_eps_gt)
+
+            fig, axes = plt.subplots(4, 1, figsize=(4, 12))
+            def show(ax, tensor2d, title, cmap='viridis'):
+                im = ax.imshow(tensor2d, cmap=cmap)
+                ax.set_title(title, fontsize=9)
+                ax.axis('off')  # Remove axis ticks and lines
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+            show(axes[0], real_pred, 'Pred Contrast (Real)')
+            show(axes[1], real_eps_pred, 'Pred Target (Real)')
+            show(axes[2], real_eps_gt, 'GT Target (Real)')
+            show(axes[3], real_eps_err, 'Abs Error (Real)')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f"sample_{sample_idx}_contrasts_real.pdf"), dpi=150)
+            plt.close(fig)
+
+
+            #####################################################################
+            # Demonstrate effect of weighted filtering on the reconstructions in a 2x2 plot
+            #####################################################################
+            # Unfiltered
+
+
+            mae = torch.mean(torch.abs(mean_recon - y)).item()
+            mse = torch.mean((mean_recon - y) ** 2).item()
+            print(f"Samples {collected}-{collected+take} MAE={mae:.4e} MSE={mse:.4e}")
+
+            for i in range(take):
+                idx_global = collected + i
+                # Updated: 2x4 layout (remove first background visualization)
+                fig, axes = plt.subplots(2, 4, figsize=(14, 6))
+                def show(ax, tensor2d, title, cmap='viridis'):
+                    im = ax.imshow(tensor2d, cmap=cmap)
+                    ax.set_title(title, fontsize=9)
+                    ax.axis('off')
+                    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                # Row 0 (Real): GT | Mean | Std | Abs Err
+                show(axes[0,0], y[i,0].cpu(), 'GT (Real)')
+                show(axes[0,1], mean_contrasts_pred[i,0], 'Mean Recon (Real)')
+                show(axes[0,2], std_contrasts_pred[i,2], 'Std (Real)', cmap='plasma')
+                show(axes[0,3], torch.abs(mean_contrasts_pred[i,0]-y[i,0].cpu()), 'Abs Err (Real)', cmap='magma')
+                # Row 1 (Imag): GT | Mean | Std | Abs Err
+                show(axes[1,0], y[i,1].cpu(), 'GT (Imag)')
+                show(axes[1,1], mean_contrasts_pred[i,1], 'Mean Recon (Imag)')
+                show(axes[1,2], std_contrasts_pred[i,3], 'Std (Imag)', cmap='plasma')
+                show(axes[1,3], torch.abs(mean_contrasts_pred[i,1]-y[i,1].cpu()), 'Abs Err (Imag)', cmap='magma')
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f"sample_{idx_global}.pdf"), dpi=150)
+                plt.close(fig)
+            collected += take
+            if collected >= num_cases:
+                break
+    print(f"Saved {collected} test reconstruction figures to {output_dir}")
+
+
 def generate_calibration_curve(model: LitUNet,
     test_loader,
     num_cases: int = 100,
@@ -867,9 +1007,9 @@ def generate_calibration_curve(model: LitUNet,
 def main():
     parser = argparse.ArgumentParser(description="Train UNet to map synth fields (24x24x2) -> grids (100x100x2)")
     parser.add_argument("--data", type=str, default="all_data.mat", help="Path to .mat file")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--base-channels", type=int, default=64)
     parser.add_argument("--val-split", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -879,7 +1019,7 @@ def main():
     parser.add_argument("--test-only", action="store_true", help="Skip training and run test on a checkpoint.")
     parser.add_argument("--ckpt-path", type=str, default=None, help="Path to checkpoint for testing. If None, finds latest.")
     parser.add_argument("--experiment-tag", type=str, default="mbg_train_synth_test_cal_exp_25bkgs", help="Tag for experiment (used in logging)")
-    parser.add_argument("--num-backgrounds", type=int, default=25, help="Number of backgrounds to use from training dataset")
+    parser.add_argument("--num-backgrounds", type=int, default=1, help="Number of backgrounds to use from training dataset")
     parser.add_argument("--steps-per-epoch", type=int, default=None, help="Number of training steps per epoch. If None, uses full dataset. Data will be reused if this exceeds dataset size.")
 
     args = parser.parse_args()
@@ -897,6 +1037,7 @@ def main():
         steps_per_epoch=args.steps_per_epoch,
     )
 
+    #args.test_only = True
     if not args.test_only:
         # --- Training Phase ---
         train_base_ds = train_loader.dataset.dataset if hasattr(train_loader.dataset, 'dataset') else train_loader.dataset
@@ -909,7 +1050,7 @@ def main():
             bkgs=bg_grids_tensor,
             bkg_sct_fields=bg_fields_tensor,
             in_channels=2,
-            out_channels=2,
+            out_channels=4,
             base_channels=args.base_channels,
             lr=args.lr,
             experiment_tag=EXPERIMENT_TAG
@@ -981,7 +1122,7 @@ def main():
 
     print(f"Successfully loaded model with {model.bkgs.shape[0]} backgrounds")
     
-    #test(model=model, test_loader=test_loader)
+    test_bcnn(model=model, test_loader=test_loader)
     # generate_calibration_curve(model=model, test_loader=test_loader, output_dir="figures/test")
     # litmus_test(model=model, in_range_test_loader=test_loader, out_of_range_test_loader=sparam_test_loader)
 
