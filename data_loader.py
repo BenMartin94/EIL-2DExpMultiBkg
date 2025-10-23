@@ -38,19 +38,29 @@ class FieldsDataset(Dataset):
         return x, y
 
 
-def load_data(file_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def load_data(file_path: str, seed: int, num_synthetic_test_samples: int = 25) -> Tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:
     """
     Load data from .mat file and convert to real/imaginary representation.
     
     Args:
         file_path: Path to the .mat file containing the data
+        seed: Random seed for shuffling
+        num_synthetic_test_samples: Number of samples to reserve for testing
         
     Returns:
-        synth_fields: Synthesized scattered fields (N, 24, 24, 2)
-        cal_e_fields: Calibrated E-fields (N, 24, 24, 2)
-        grids: Epsilon grids (N, 100, 100, 2)
-        uncal_spars: Uncalibrated S-parameters (N, 24, 24, 2)
+        synth_fields: Synthesized scattered fields for training (N-num_test, 24, 24, 2)
+        cal_e_fields: Calibrated E-fields for training (N-num_test, 24, 24, 2)
+        grids: Epsilon grids for training (N-num_test, 100, 100, 2)
+        uncal_spars: Uncalibrated S-parameters for training (N-num_test, 24, 24, 2)
+        synth_fields_test: Synthesized scattered fields for testing (num_test, 24, 24, 2)
+        cal_e_fields_test: Calibrated E-fields for testing (num_test, 24, 24, 2)
+        grids_test: Epsilon grids for testing (num_test, 100, 100, 2)
+        uncal_spars_test: Uncalibrated S-parameters for testing (num_test, 24, 24, 2)
     """
+    np.random.seed(seed)
     grids, uncal_spars, cal_e_fields, synth_fields = data_main.read_mat_file(file_path)
     
     # Convert complex to real/imag last dim
@@ -64,5 +74,25 @@ def load_data(file_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.nd
     synth_fields = synth_fields.astype(np.float32, copy=False)
     cal_e_fields = cal_e_fields.astype(np.float32, copy=False)
     uncal_spars = uncal_spars.astype(np.float32, copy=False)
+
+    # Shuffle the data
+    indices = np.arange(len(synth_fields))
+    np.random.shuffle(indices)
+    synth_fields = synth_fields[indices]
+    cal_e_fields = cal_e_fields[indices]
+    grids = grids[indices]
+    uncal_spars = uncal_spars[indices]
+
+    # Split into train and test sets
+    synth_fields_test = synth_fields[:num_synthetic_test_samples]
+    cal_e_fields_test = cal_e_fields[:num_synthetic_test_samples]
+    grids_test = grids[:num_synthetic_test_samples]
+    uncal_spars_test = uncal_spars[:num_synthetic_test_samples]
     
-    return synth_fields, cal_e_fields, grids, uncal_spars
+    synth_fields = synth_fields[num_synthetic_test_samples:]
+    cal_e_fields = cal_e_fields[num_synthetic_test_samples:]
+    grids = grids[num_synthetic_test_samples:]
+    uncal_spars = uncal_spars[num_synthetic_test_samples:]
+
+    return (synth_fields, cal_e_fields, grids, uncal_spars,
+            synth_fields_test, cal_e_fields_test, grids_test, uncal_spars_test)

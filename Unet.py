@@ -52,7 +52,7 @@ class Up(nn.Module):
         self.bilinear = bilinear
 
         if bilinear:
-            self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+            self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
             # Reduce decoder feature maps to out_ch so that cat([skip, up]) has x2_ch + out_ch channels
             self.reduce = nn.Conv2d(x1_ch, out_ch, kernel_size=1)
         else:
@@ -95,7 +95,7 @@ class UpNoSkip(nn.Module):
         super().__init__()
         self.bilinear = bilinear
         # if bilinear:
-        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
         self.reduce = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         # else:
         #     self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)

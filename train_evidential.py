@@ -325,7 +325,8 @@ def build_loaders(
     val_split: float,
     num_workers: int,
     seed: int,
-    test_field_type: str = "cal"
+    test_field_type: str = "cal",
+    num_synthetic_test_samples: int = 25
 ):
     """
     Build data loaders for training and validation.
@@ -337,27 +338,35 @@ def build_loaders(
         num_workers: Number of data loading workers
         seed: Random seed for reproducibility
         test_field_type: Type of field data to use for test set ("synth", "cal", or "uncal")
+        num_synthetic_test_samples: Number of samples to reserve for testing
     
     Returns:
         train_loader, val_loader, test_loader
     """
-    synth_fields, cal_e_fields, grids, uncal_spars = load_data(file_path)
+    # Load data with train/test split already done
+    (synth_fields, cal_e_fields, grids, uncal_spars,
+     synth_fields_test, cal_e_fields_test, grids_test, uncal_spars_test) = load_data(
+        file_path, seed=seed, num_synthetic_test_samples=num_synthetic_test_samples
+    )
     
     # Always use synth fields for training/validation
     train_val_dataset = FieldsDataset(x_np=synth_fields, y_np=grids)
     
     # Select test field data
     if test_field_type == "synth":
-        test_fields = synth_fields
+        test_fields = synth_fields_test
+        test_grids = grids_test
     elif test_field_type == "cal":
-        test_fields = cal_e_fields
+        test_fields = cal_e_fields_test
+        test_grids = grids_test
     elif test_field_type == "uncal":
-        test_fields = uncal_spars
+        test_fields = uncal_spars_test
+        test_grids = grids_test
     else:
         raise ValueError(f"Unknown test_field_type: {test_field_type}. Choose from 'synth', 'cal', or 'uncal'")
     
     # Create test dataset
-    test_dataset = FieldsDataset(x_np=test_fields, y_np=grids)
+    test_dataset = FieldsDataset(x_np=test_fields, y_np=test_grids)
     
     # Split train/val dataset
     n_total = len(train_val_dataset)
@@ -390,6 +399,7 @@ def test(
     num_cases: int = 10,
     output_dir: str = "figures/test_evidential",
     device: str | None = None,
+    percent_noise_level: float = 0.1
 ):
     """
     Run testing on a handful of test samples.
@@ -424,6 +434,19 @@ def test(
             take = min(B, num_cases - collected)
             if take <= 0:
                 break
+
+            # Compute signal power for each sample in the batch
+            signal_power = torch.mean(x ** 2, dim=(1, 2, 3), keepdim=True)  # (take, 1, 1, 1)
+            
+            # Calculate noise standard deviation based on percentage
+            noise_std = torch.sqrt(signal_power * percent_noise_level)
+            
+            # Generate Gaussian noise with the calculated std
+            noise = torch.randn_like(x) * noise_std
+            
+            # Add noise to input
+            x = x + noise
+
             x = x.to(device)[:take]
             y = y.to(device)[:take]
 
@@ -531,7 +554,7 @@ def main():
     parser.add_argument("--test-only", action="store_true", help="Skip training and run test on a checkpoint.")
     parser.add_argument("--ckpt-path", type=str, default=None, help="Path to checkpoint for testing. If None, finds latest.")
     parser.add_argument("--experiment-tag", type=str, default="evidential_experiment", help="Tag for experiment (used in logging)")
-    parser.add_argument("--test-field-type", type=str, default="cal", choices=["synth", "cal", "uncal"], 
+    parser.add_argument("--test-field-type", type=str, default="synth", choices=["synth", "cal", "uncal"], 
                         help="Type of field data to use for test set (training always uses synth)")
 
     args = parser.parse_args()

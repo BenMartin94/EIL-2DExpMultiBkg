@@ -576,9 +576,17 @@ class LitUNet(pl.LightningModule):
         return optimizer
 
 
-def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers: int, seed: int, num_backgrounds: int = 25, steps_per_epoch: int = None):
-    synth_fields, cal_e_fields, grids, uncal_spars = load_data(file_path)
+def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers: int, seed: int, num_backgrounds: int = 25, steps_per_epoch: int = None, num_synthetic_test_samples: int = 25):
+    # Load data with train/test split already done
+    (synth_fields, cal_e_fields, grids, uncal_spars,
+     synth_fields_test, cal_e_fields_test, grids_test, uncal_spars_test) = load_data(
+        file_path, seed=seed, num_synthetic_test_samples=num_synthetic_test_samples
+    )
+
+    # cal_e_fields and uncal_spars are only used for testing so there is no need to use their *test* versions, those were only created for clarity and symmetry.
+
     synth_dataset = MultiBkgDataset(fields=synth_fields, grids=grids, n_backgrounds=num_backgrounds)
+    synth_test_dataset = FieldsDataset(x_np=synth_fields_test, y_np=grids_test)
     exp_dataset = FieldsDataset(x_np=cal_e_fields, y_np=grids)
     sparam_dataset = FieldsDataset(x_np=uncal_spars, y_np=grids)
     n_total = len(synth_dataset)
@@ -609,6 +617,13 @@ def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers:
         pin_memory=True,
         generator=test_gen,
     )
+    synth_test_loader = DataLoader(
+        synth_test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
     sparam_test_loader = DataLoader(
         sparam_dataset,
         batch_size=batch_size,
@@ -618,7 +633,7 @@ def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers:
         generator=sparam_gen,
     )
 
-    return train_loader, val_loader, test_loader, sparam_test_loader
+    return train_loader, val_loader, synth_test_loader,test_loader, sparam_test_loader
 
 
 def test(
@@ -627,6 +642,7 @@ def test(
     num_cases: int = 10,
     output_dir: str = "figures/test",
     device: str | None = None,
+    percent_noise_level: float = 0.01,
 ):
     """Run reconstruction on a handful of test samples using backgrounds stored in the model.
 
@@ -636,6 +652,7 @@ def test(
         num_cases: Number of individual samples to visualize.
         output_dir: Directory to save figures.
         device: Optional device override.
+        percent_noise_level: Percentage of signal power to use as noise level when adding noise to inputs. 0.1 for 10%
     """
     os.makedirs(output_dir, exist_ok=True)
     if device is None:
@@ -662,8 +679,22 @@ def test(
             take = min(B, num_cases - collected)
             if take <= 0:
                 break
+
             x = x.to(device)[:take]
             y = y.to(device)[:take]
+            
+            
+            # Compute signal power for each sample in the batch
+            signal_power = torch.mean(x ** 2, dim=(1, 2, 3), keepdim=True)  # (take, 1, 1, 1)
+            
+            # Calculate noise standard deviation based on percentage
+            noise_std = torch.sqrt(signal_power * percent_noise_level)
+            
+            # Generate Gaussian noise with the calculated std
+            noise = torch.randn_like(x) * noise_std
+            
+            # Add noise to input
+            x = x + noise
 
             nbkgs = model.bkgs.shape[0]
             assert nbkgs > 0, "Model has no backgrounds stored for reconstruction."
@@ -770,88 +801,6 @@ def test(
     
     print(f"Saved {collected} test reconstruction figures to {output_dir}")
 
-def generate_calibration_curve(model: LitUNet,
-    test_loader,
-    num_cases: int = 100,
-    output_dir: str = "figures/test",
-    device: str | None = None
-    ):
-    from uncertainty_cal_eval import calibration_curve
-    os.makedirs(output_dir, exist_ok=True)
-
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    model.to(device)
-    model.eval()
-
-    nbkgs = getattr(model, 'bkgs', None)
-    if nbkgs is None:
-        raise RuntimeError("Model has no stored backgrounds for calibration curve generation.")
-    nbkgs_count = model.bkgs.shape[0]
-    assert nbkgs_count > 0, "Model has no backgrounds stored for reconstruction."
-
-    means = []
-    stds = []
-    targets = []
-
-    remaining = float('inf') if num_cases is None else max(int(num_cases), 0)
-
-    with torch.no_grad():
-        for batch in test_loader:
-            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-                x, y = batch[:2]
-            else:
-                raise RuntimeError("Expected (x,y) batch from test_loader")
-
-            if remaining <= 0:
-                break
-
-            B = x.shape[0]
-            take = B if remaining == float('inf') else min(B, remaining)
-            x = x.to(device)[:take]
-            y = y.to(device)[:take]
-
-            bg_grid = model.bkgs.unsqueeze(0).expand(take, -1, -1, -1, -1)
-            bg_sct = model.bkg_sct_fields.unsqueeze(0).expand(take, -1, -1, -1, -1)
-            _, mean_recon, std_recon = model.reconstruction(x, bg_sct, bg_grid)
-
-            means.append(mean_recon.cpu().numpy())
-            stds.append(std_recon.cpu().numpy())
-            targets.append(y.cpu().numpy())
-
-            if remaining != float('inf'):
-                remaining -= take
-
-    if not means:
-        raise RuntimeError("No samples were processed for calibration curve generation.")
-    mean_arr = np.concatenate(means, axis=0)
-    std_arr = np.concatenate(stds, axis=0)
-    target_arr = np.concatenate(targets, axis=0)
-
-    print(mean_arr.shape, std_arr.shape, target_arr.shape)
-
-    expected_conf, observed_conf = calibration_curve(mean_arr, std_arr, target_arr)
-
-    fig, ax = plt.subplots(figsize=(5, 5))
-    ax.plot(expected_conf, observed_conf, label='Observed')
-    ax.plot([0, 1], [0, 1], linestyle='--', color='gray', label='Ideal')
-    ax.set_xlabel('Expected confidence')
-    ax.set_ylabel('Observed coverage')
-    ax.set_title('Calibration Curve')
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-
-    output_path = os.path.join(output_dir, 'calibration_curve.pdf')
-    fig.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-
-    print(f"Calibration curve saved to {output_path}")
-
-    return expected_conf, observed_conf
-
 
 def main():
     parser = argparse.ArgumentParser(description="Train UNet to map synth fields (24x24x2) -> grids (100x100x2)")
@@ -876,7 +825,7 @@ def main():
     EXPERIMENT_TAG = args.experiment_tag
     print(f"Steps per epoch: {args.steps_per_epoch}")
 
-    train_loader, val_loader, test_loader, sparam_test_loader = build_loaders(
+    train_loader, val_loader, synth_test_loader, test_loader, sparam_test_loader = build_loaders(
         file_path=args.data,
         batch_size=args.batch_size,
         val_split=args.val_split,
@@ -970,7 +919,7 @@ def main():
 
     print(f"Successfully loaded model with {model.bkgs.shape[0]} backgrounds")
     
-    test(model=model, test_loader=test_loader)
+    test(model=model, test_loader=synth_test_loader)
     # generate_calibration_curve(model=model, test_loader=test_loader, output_dir="figures/test")
     # litmus_test(model=model, in_range_test_loader=test_loader, out_of_range_test_loader=sparam_test_loader)
 
