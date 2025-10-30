@@ -38,6 +38,51 @@ class FieldsDataset(Dataset):
         return x, y
 
 
+class AugmentedFieldsDataset(Dataset):
+    """
+    Dataset wrapper that adds random Gaussian noise to input fields during training.
+    
+    This is useful for data augmentation to make models more robust to noisy inputs.
+    
+    Args:
+        base_dataset: Underlying dataset (e.g., FieldsDataset or random_split subset)
+        noise_std: Standard deviation of Gaussian noise to add (relative to signal)
+        noise_type: Type of noise - 'absolute' or 'relative' (default: 'absolute')
+                    - 'absolute': adds noise with fixed std
+                    - 'relative': adds noise proportional to signal magnitude
+    
+    Example:
+        >>> base_ds = FieldsDataset(x_np, y_np)
+        >>> augmented_ds = AugmentedFieldsDataset(base_ds, noise_std=0.01)
+        >>> train_loader = DataLoader(augmented_ds, batch_size=32, shuffle=True)
+    """
+    def __init__(self, base_dataset, noise_std: float = 0.0, noise_type: str = 'absolute', size_multiplier=1):
+        self.base_dataset = base_dataset
+        self.noise_std = noise_std
+        self.noise_type = noise_type
+        self.size_multiplier = size_multiplier
+
+    def __len__(self) -> int:
+        return len(self.base_dataset) * self.size_multiplier
+
+    def __getitem__(self, idx: int):
+        x, y = self.base_dataset[idx % len(self.base_dataset)]
+        
+        # Add noise to input if noise_std > 0
+        if self.noise_std > 0:
+            if self.noise_type == 'relative':
+                # Noise proportional to signal magnitude
+                signal_magnitude = torch.sqrt(x[0]**2 + x[1]**2).mean()
+                noise = torch.randn_like(x) * self.noise_std * signal_magnitude
+            else:  # absolute
+                # Fixed noise level
+                noise = torch.randn_like(x) * self.noise_std
+            
+            x = x + noise
+        
+        return x, y
+
+
 def load_data(file_path: str, seed: int, num_synthetic_test_samples: int = 25) -> Tuple[
     np.ndarray, np.ndarray, np.ndarray, np.ndarray,
     np.ndarray, np.ndarray, np.ndarray, np.ndarray

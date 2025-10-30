@@ -14,53 +14,33 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 import matplotlib.pyplot as plt
 
-from Unet import UNet, bayesian_loss
+from Unet import UNetBCNN, bayesian_loss
 import main as data_main
 from MultiBkgDataset import MultiBkgDataset
 from Litmus_test import litmus_test
+from data_loader import load_data, FieldsDataset, AugmentedFieldsDataset
 
-
-class FieldsDataset(Dataset):
-    """
-    Dataset wrapping channels-last numpy arrays.
-    X: (N, 24, 24, 2)
-    Y: (N, 100, 100, 2)
-    Returns tensors in channels-first: X -> (2,24,24), Y -> (2,100,100)
-    """
-
-    def __init__(self, x_np: np.ndarray, y_np: np.ndarray, dtype: torch.dtype = torch.float32):
-        assert x_np.ndim == 4 and y_np.ndim == 4, "Expected (N,H,W) arrays"
-        assert x_np.shape[0] == y_np.shape[0], "Mismatched batch sizes"
-        assert x_np.shape[-1] == 2 and y_np.shape[-1] == 2, "Expected 2-channel real/imag in last dim"
-        self.x = x_np
-        self.y = y_np
-        self.dtype = dtype
-
-    def __len__(self) -> int:
-        return self.x.shape[0]
-
-    def __getitem__(self, idx: int):
-        x = self.x[idx]
-        y = self.y[idx]
-        # (H,W,C) -> (C,H,W)
-        x = torch.from_numpy(np.ascontiguousarray(np.transpose(x, (2, 0, 1)))).to(self.dtype)
-        y = torch.from_numpy(np.ascontiguousarray(np.transpose(y, (2, 0, 1)))).to(self.dtype)
-        return x, y
 
 
 class LitBCNNUNet(pl.LightningModule):
     def __init__(
         self,
         in_channels: int = 2,
-        out_channels: int = 2,
+        out_channels: int = 4,  # 2 for prediction + 2 for log variance
         base_channels: int = 64,
+        dropout_rate: float = 0.05,
         lr: float = 1e-3,
         experiment_tag: str = "experiment",
     ):
         super().__init__()
         # Save hyperparameters, ignoring large tensors.
         self.save_hyperparameters(ignore=['bkgs', 'bkg_sct_fields'])
-        self.model = UNet(in_channels=in_channels, out_channels=out_channels, base_channels=base_channels)
+        self.model = UNetBCNN(
+            in_channels=in_channels, 
+            out_channels=out_channels, 
+            base_channels=base_channels,
+            dropout_rate=dropout_rate
+        )
         self.criterion = bayesian_loss
         #self.criterion = torch.nn.MSELoss()
         self.experiment_tag = experiment_tag
@@ -282,28 +262,16 @@ class LitBCNNUNet(pl.LightningModule):
         return optimizer
 
 
-def load_data(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
-    grids, uncal_spars, cal_e_fields, synth_fields = data_main.read_mat_file(file_path)
-    # Convert complex to real/imag last dim
-    grids = data_main.split_complex_to_real_imag(grids)       # (N,100,100,2)
-    synth_fields = data_main.split_complex_to_real_imag(synth_fields)  # (N,24,24,2)
-    cal_e_fields = data_main.split_complex_to_real_imag(cal_e_fields)  # (N,24,24,2)
-    uncal_spars = data_main.split_complex_to_real_imag(uncal_spars)  # (N,24,24,2)
-
-    # Cast to float32 for training
-    grids = grids.astype(np.float32, copy=False)
-    synth_fields = synth_fields.astype(np.float32, copy=False)
-    cal_e_fields = cal_e_fields.astype(np.float32, copy=False)
-    return synth_fields, cal_e_fields, grids, uncal_spars
-
-
 def build_loaders(
     file_path: str,
     batch_size: int,
     val_split: float,
     num_workers: int,
     seed: int,
-    test_field_type: str = "cal"
+    test_field_type: str = "cal",
+    num_synthetic_test_samples: int = 25,
+    augment_noise_std: float = 0.0,
+    augment_noise_type: str = 'absolute'
 ):
     """
     Build data loaders for training and validation.
@@ -315,27 +283,37 @@ def build_loaders(
         num_workers: Number of data loading workers
         seed: Random seed for reproducibility
         test_field_type: Type of field data to use for test set ("synth", "cal", or "uncal")
+        num_synthetic_test_samples: Number of samples to reserve for testing
+        augment_noise_std: Standard deviation of noise to add for data augmentation (0 = no augmentation)
+        augment_noise_type: Type of noise - 'absolute' or 'relative'
     
     Returns:
         train_loader, val_loader, test_loader
     """
-    synth_fields, cal_e_fields, grids, uncal_spars = load_data(file_path)
+    # Load data with train/test split already done
+    (synth_fields, cal_e_fields, grids, uncal_spars,
+     synth_fields_test, cal_e_fields_test, grids_test, uncal_spars_test) = load_data(
+        file_path, seed=seed, num_synthetic_test_samples=num_synthetic_test_samples
+    )
     
     # Always use synth fields for training/validation
     train_val_dataset = FieldsDataset(x_np=synth_fields, y_np=grids)
     
     # Select test field data
     if test_field_type == "synth":
-        test_fields = synth_fields
+        test_fields = synth_fields_test
+        test_grids = grids_test
     elif test_field_type == "cal":
-        test_fields = cal_e_fields
+        test_fields = cal_e_fields_test
+        test_grids = grids_test
     elif test_field_type == "uncal":
-        test_fields = uncal_spars
+        test_fields = uncal_spars_test
+        test_grids = grids_test
     else:
         raise ValueError(f"Unknown test_field_type: {test_field_type}. Choose from 'synth', 'cal', or 'uncal'")
     
     # Create test dataset
-    test_dataset = FieldsDataset(x_np=test_fields, y_np=grids)
+    test_dataset = FieldsDataset(x_np=test_fields, y_np=test_grids)
     
     # Split train/val dataset
     n_total = len(train_val_dataset)
@@ -343,6 +321,11 @@ def build_loaders(
     n_train = n_total - n_val
     g = torch.Generator().manual_seed(seed)
     train_ds, val_ds = random_split(train_val_dataset, [n_train, n_val], generator=g)
+    
+    # Apply data augmentation to training set if noise_std > 0
+    if augment_noise_std > 0:
+        print(f"Applying data augmentation with {augment_noise_type} noise (std={augment_noise_std})")
+        train_ds = AugmentedFieldsDataset(train_ds, noise_std=augment_noise_std, noise_type=augment_noise_type, size_multiplier=25)
     
     # Create data loaders
     train_loader = DataLoader(
@@ -461,7 +444,7 @@ def test(
 def main():
     parser = argparse.ArgumentParser(description="Train BCNN UNet for EM field reconstruction")
     parser.add_argument("--data", type=str, default="all_data.mat", help="Path to .mat file")
-    parser.add_argument("--epochs", type=int, default=800)
+    parser.add_argument("--epochs", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--base-channels", type=int, default=64)
@@ -475,8 +458,12 @@ def main():
     parser.add_argument("--test-only", action="store_true", help="Skip training and run test on a checkpoint.")
     parser.add_argument("--ckpt-path", type=str, default=None, help="Path to checkpoint for testing. If None, finds latest.")
     parser.add_argument("--experiment-tag", type=str, default="bcnn_experiment_800", help="Tag for experiment (used in logging)")
-    parser.add_argument("--test-field-type", type=str, default="cal", choices=["synth", "cal", "uncal"], 
+    parser.add_argument("--test-field-type", type=str, default="synth", choices=["synth", "cal", "uncal"], 
                         help="Type of field data to use for test set (training always uses synth)")
+    parser.add_argument("--augment-noise-std", type=float, default=0.1, 
+                        help="Standard deviation of noise for data augmentation (0 = no augmentation)")
+    parser.add_argument("--augment-noise-type", type=str, default="relative", choices=["absolute", "relative"],
+                        help="Type of noise: 'absolute' (fixed std) or 'relative' (proportional to signal)")
 
     args = parser.parse_args()
     
@@ -488,7 +475,9 @@ def main():
         val_split=args.val_split,
         num_workers=args.num_workers,
         seed=args.seed,
-        test_field_type=args.test_field_type
+        test_field_type=args.test_field_type,
+        augment_noise_std=args.augment_noise_std,
+        augment_noise_type=args.augment_noise_type
     )
 
     #args.test_only = True

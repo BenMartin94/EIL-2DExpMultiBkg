@@ -19,7 +19,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 import matplotlib.pyplot as plt
 
 from evidential import EvidentialUnet, evidential_NLL, reg_loss_1, reg_loss_2
-from data_loader import load_data, FieldsDataset
+from data_loader import load_data, FieldsDataset, AugmentedFieldsDataset
 from uncertainty_cal_eval import error_std_correlation
 
 
@@ -326,7 +326,9 @@ def build_loaders(
     num_workers: int,
     seed: int,
     test_field_type: str = "cal",
-    num_synthetic_test_samples: int = 25
+    num_synthetic_test_samples: int = 25,
+    augment_noise_std: float = 0.1,
+    augment_noise_type: str = 'relative'
 ):
     """
     Build data loaders for training and validation.
@@ -339,6 +341,8 @@ def build_loaders(
         seed: Random seed for reproducibility
         test_field_type: Type of field data to use for test set ("synth", "cal", or "uncal")
         num_synthetic_test_samples: Number of samples to reserve for testing
+        augment_noise_std: Standard deviation of noise to add for data augmentation (0 = no augmentation)
+        augment_noise_type: Type of noise - 'absolute' or 'relative'
     
     Returns:
         train_loader, val_loader, test_loader
@@ -374,6 +378,11 @@ def build_loaders(
     n_train = n_total - n_val
     g = torch.Generator().manual_seed(seed)
     train_ds, val_ds = random_split(train_val_dataset, [n_train, n_val], generator=g)
+    
+    # Apply data augmentation to training set if noise_std > 0
+    if augment_noise_std > 0:
+        print(f"Applying data augmentation with {augment_noise_type} noise (std={augment_noise_std})")
+        train_ds = AugmentedFieldsDataset(train_ds, noise_std=augment_noise_std, noise_type=augment_noise_type, size_multiplier=25)
     
     # Create data loaders
     train_loader = DataLoader(
@@ -556,6 +565,10 @@ def main():
     parser.add_argument("--experiment-tag", type=str, default="evidential_experiment", help="Tag for experiment (used in logging)")
     parser.add_argument("--test-field-type", type=str, default="synth", choices=["synth", "cal", "uncal"], 
                         help="Type of field data to use for test set (training always uses synth)")
+    parser.add_argument("--augment-noise-std", type=float, default=0.1, 
+                        help="Standard deviation of noise for data augmentation (0 = no augmentation)")
+    parser.add_argument("--augment-noise-type", type=str, default="relative", choices=["absolute", "relative"],
+                        help="Type of noise: 'absolute' (fixed std) or 'relative' (proportional to signal)")
 
     args = parser.parse_args()
     
@@ -568,7 +581,9 @@ def main():
         val_split=args.val_split,
         num_workers=args.num_workers,
         seed=args.seed,
-        test_field_type=args.test_field_type
+        test_field_type=args.test_field_type,
+        augment_noise_std=args.augment_noise_std,
+        augment_noise_type=args.augment_noise_type
     )
 
     if not args.test_only:

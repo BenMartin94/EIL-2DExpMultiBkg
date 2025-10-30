@@ -158,7 +158,7 @@ class LitUNet(pl.LightningModule):
         contrast = fg_sct_expanded - bg_sct  # (B,nbkgs,2,24,24)
         contrast_reshaped = contrast.view(B * nbkgs, 2, H, W)
         pred_contrast_grid = self(contrast_reshaped)  # (B*nbkgs,2,100,100)
-        pred_contrast_grid = pred_contrast_grid.view(B, nbkgs, 4, 100, 100)
+        pred_contrast_grid = pred_contrast_grid.view(B, nbkgs, 2, 100, 100)
 
         # Complex reconstruction
         pred_contrast_complex = pred_contrast_grid[:, :, 0] + 1j * pred_contrast_grid[:, :, 1]
@@ -809,137 +809,6 @@ def test(
     print("="*60 + "\n")
     
     print(f"Saved {collected} test reconstruction figures to {output_dir}")
-    print(f"Saved {collected} test reconstruction figures to {output_dir}")
-
-
-def test_bcnn(
-    model: LitUNet,
-    test_loader,
-    num_cases: int = 10,
-    output_dir: str = "figures/test",
-    device: str | None = None,
-):
-    """Run reconstruction on a handful of test samples using backgrounds stored in the model.
-
-    Args:
-        model: Trained LitUNet instance with internal backgrounds (bkgs & bkg_sct_fields buffers).
-        test_loader: DataLoader providing experimental (x,y) pairs (x: (B,2,24,24), y: (B,2,100,100)).
-        num_cases: Number of individual samples to visualize.
-        output_dir: Directory to save figures.
-        device: Optional device override.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    model.to(device)
-    model.eval()
-    model.enable_dropout()
-
-    collected = 0
-    with torch.no_grad():
-        for batch in test_loader:
-            # FieldsDataset returns (x,y)
-            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-                x, y = batch[:2]
-            else:
-                raise RuntimeError("Expected (x,y) batch from test_loader")
-            B = x.shape[0]
-            take = min(B, num_cases - collected)
-            if take <= 0:
-                break
-            x = x.to(device)[:take]
-            y = y.to(device)[:take]
-
-            nbkgs = model.bkgs.shape[0]
-            assert nbkgs > 0, "Model has no backgrounds stored for reconstruction."
-            assert nbkgs < 2, "Warning: Number of backgrounds > 1, did you call the wrong function?"
-            bg_grid = model.bkgs.unsqueeze(0).expand(take, -1, -1, -1, -1)          # (take,nbkgs,2,100,100)
-            bg_sct = model.bkg_sct_fields.unsqueeze(0).expand(take, -1, -1, -1, -1)  # (take,nbkgs,2,24,24)
-            
-            scts = x.unsqueeze(1).expand(-1, nbkgs, -1, -1, -1) - bg_sct  # (take,nbkgs,2,24,24)
-            MC_count = (5)
-            contrasts_pred_K = torch.zeros((MC_count, take, nbkgs, 4, 100, 100), dtype=torch.float32)
-            old_contrasts_pred_K = torch.zeros((MC_count, take, nbkgs, 4, 100, 100), dtype=torch.float32)
-            for k in range(MC_count):
-                per_bkg_recons, mean_recon, std_recon = model.reconstruction(x, bg_sct, bg_grid)
-                contrasts_pred = model(scts.view(take, 2, 24, 24))  # (take*nbkgs,2,100,100)
-                contrasts_pred = contrasts_pred.view(take, 1, 4, 100, 100)
-                old_contrasts_pred_K[k,...] = contrasts_pred.cpu()
-                contrasts_pred_K[k,:,:,:2,...] = mean_recon.view(take, 1, 2, 100, 100).cpu()
-                contrasts_pred_K[k,:,:,2:,...] = std_recon.view(take, 1, 2, 100, 100).cpu()
-
-            mean_contrasts_pred = torch.mean(contrasts_pred_K.squeeze(), axis=0)
-            std_contrasts_pred = torch.std(contrasts_pred_K.squeeze(), axis=0)
-
-            y_complex = y[:,0] + 1j * y[:,1]
-            y_complex = y_complex.unsqueeze(1).expand(-1, 1, -1, -1)  # (take,nbkgs,100,100)
-            bg_complex = bg_grid[:,:,0] + 1j * bg_grid[:,:,1]
-            contrasts_gt_complex = (y_complex - bg_complex) / bg_complex
-            contrasts_gt = torch.stack([contrasts_gt_complex.real, contrasts_gt_complex.imag], dim=2)  # (take,nbkgs,4,100,100)
-
-            # Plot 4x1 real-channel contrast (prediction / ground-truth / abs error) for first sample
-
-            sample_idx = collected  # global sample index for this first example in the current batch
-            real_pred = contrasts_pred[0, 0, 0].cpu()  # (100,100)
-            real_gt = contrasts_gt[0, 0, 0].cpu()      # (100,100)
-            real_err = torch.abs(real_pred - real_gt)
-            real_eps_pred = per_bkg_recons[0,0,0].cpu()
-            real_eps_gt = y[0,0].cpu()
-            real_eps_err = torch.abs(real_eps_pred - real_eps_gt)
-
-            fig, axes = plt.subplots(4, 1, figsize=(4, 12))
-            def show(ax, tensor2d, title, cmap='viridis'):
-                im = ax.imshow(tensor2d, cmap=cmap)
-                ax.set_title(title, fontsize=9)
-                ax.axis('off')  # Remove axis ticks and lines
-                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-            show(axes[0], real_pred, 'Pred Contrast (Real)')
-            show(axes[1], real_eps_pred, 'Pred Target (Real)')
-            show(axes[2], real_eps_gt, 'GT Target (Real)')
-            show(axes[3], real_eps_err, 'Abs Error (Real)')
-
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, f"sample_{sample_idx}_contrasts_real.pdf"), dpi=150)
-            plt.close(fig)
-
-
-            #####################################################################
-            # Demonstrate effect of weighted filtering on the reconstructions in a 2x2 plot
-            #####################################################################
-            # Unfiltered
-
-
-            mae = torch.mean(torch.abs(mean_recon - y)).item()
-            mse = torch.mean((mean_recon - y) ** 2).item()
-            print(f"Samples {collected}-{collected+take} MAE={mae:.4e} MSE={mse:.4e}")
-
-            for i in range(take):
-                idx_global = collected + i
-                # Updated: 2x4 layout (remove first background visualization)
-                fig, axes = plt.subplots(2, 4, figsize=(14, 6))
-                def show(ax, tensor2d, title, cmap='viridis'):
-                    im = ax.imshow(tensor2d, cmap=cmap)
-                    ax.set_title(title, fontsize=9)
-                    ax.axis('off')
-                    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-                # Row 0 (Real): GT | Mean | Std | Abs Err
-                show(axes[0,0], y[i,0].cpu(), 'GT (Real)')
-                show(axes[0,1], mean_contrasts_pred[i,0], 'Mean Recon (Real)')
-                show(axes[0,2], std_contrasts_pred[i,2], 'Std (Real)', cmap='plasma')
-                show(axes[0,3], torch.abs(mean_contrasts_pred[i,0]-y[i,0].cpu()), 'Abs Err (Real)', cmap='magma')
-                # Row 1 (Imag): GT | Mean | Std | Abs Err
-                show(axes[1,0], y[i,1].cpu(), 'GT (Imag)')
-                show(axes[1,1], mean_contrasts_pred[i,1], 'Mean Recon (Imag)')
-                show(axes[1,2], std_contrasts_pred[i,3], 'Std (Imag)', cmap='plasma')
-                show(axes[1,3], torch.abs(mean_contrasts_pred[i,1]-y[i,1].cpu()), 'Abs Err (Imag)', cmap='magma')
-                plt.tight_layout()
-                plt.savefig(os.path.join(output_dir, f"sample_{idx_global}.pdf"), dpi=150)
-                plt.close(fig)
-            collected += take
-            if collected >= num_cases:
-                break
     print(f"Saved {collected} test reconstruction figures to {output_dir}")
 
 

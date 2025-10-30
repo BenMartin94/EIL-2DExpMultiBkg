@@ -534,13 +534,14 @@ def main():
                 colormap="plasma",
                 alpha=[0, 0.2, 0.4, 0.7, 1.0],
                 show_axes=True,
-                background="white"
+                background="white",
+                vmin=0.15
             )
             
             # Render absolute difference
             y_diff = np.abs(y_true - y_pred)
             render_volume(
-                volume=y_diff,
+                volume=y_diff,  
                 output_path=os.path.join(out_dir, "validation_diff_render.png"),
                 focal_point=(np.array(y_diff.shape) / 2.0),
                 image_size=(800, 800),

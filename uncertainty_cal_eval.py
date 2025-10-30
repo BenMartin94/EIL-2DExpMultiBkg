@@ -62,6 +62,24 @@ def expected_calibration_error(mean, std, targets, pis=None):
     ece = np.mean(np.abs(expected_conf - observed_conf))
     return ece
 
+def wei_ece(mean, std, targets):
+    dirac_delta = 1
+    pj = norm.cdf(mean + dirac_delta, loc=mean, scale=std) - norm.cdf(mean - dirac_delta, loc=mean, scale=std)
+    pj_flat = pj.reshape(-1)
+    L = 20
+    delta_p = 1 / L
+    pl_list = np.arange(delta_p, 1 + delta_p, delta_p)
+    creds = []
+    Sl_list = []
+    for i in range(1, L):
+        lower = pl_list[i - 1]
+        upper = pl_list[i]
+        in_bin = (pj_flat > lower) & (pj_flat <= upper)
+        Sl_delta = np.where(in_bin)[0]
+        Sl_list.append(Sl_delta)
+        
+        
+
 
 def sharpness(std):
     """

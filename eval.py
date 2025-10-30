@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 from data_loader import load_data, FieldsDataset
 from train import LitUNet
 from train_evidential import LitEvidentialUNet
+from train_bcnn import LitBCNNUNet
 from uncertainty_cal_eval import calibration_curve, expected_calibration_error, confidence_interval_coverage, error_std_correlation
 
 
@@ -67,8 +68,7 @@ def load_models(checkpoint_paths, model_types=None):
         # Determine model type
         if model_types and idx < len(model_types):
             model_type = model_types[idx]
-        else:
-            model_type = 'mbkg' if 'bkgs' in checkpoint['state_dict'] else 'evidential'
+        
         
         # Load appropriate model
         if model_type == 'mbkg':
@@ -79,6 +79,9 @@ def load_models(checkpoint_paths, model_types=None):
                 experiment_tag=experiment_tag
             )
             print(f"  ✓ Multi-background model ({model.bkgs.shape[0]} backgrounds)")
+        elif model_type == 'bcnn':
+            model = LitBCNNUNet.load_from_checkpoint(ckpt_path, strict=False, experiment_tag=experiment_tag)
+            print(f"  ✓ BCNN model")
         else:
             model = LitEvidentialUNet.load_from_checkpoint(ckpt_path, strict=False, experiment_tag=experiment_tag)
             print(f"  ✓ Evidential model")
@@ -89,30 +92,82 @@ def load_models(checkpoint_paths, model_types=None):
     return models, detected_types
 
 
-def build_data_loaders(file_path, batch_size=8, num_workers=2, seed=42):
-    """Build calibrated and uncalibrated data loaders."""
+def build_data_loaders(file_path, batch_size=8, num_workers=2, seed=42, num_synthetic_test_samples=25, val_split=0.05, num_backgrounds=25):
+    """Build all data loaders matching train.py pattern."""
     print(f"Loading data from: {file_path}")
-    synth_fields, cal_e_fields, grids, uncal_spars = load_data(file_path)
     
-    cal_loader = DataLoader(
-        FieldsDataset(x_np=cal_e_fields, y_np=grids),
-        batch_size=batch_size, shuffle=True, num_workers=num_workers,
-        pin_memory=True, generator=torch.Generator().manual_seed(seed)
-    )
-    uncal_loader = DataLoader(
-        FieldsDataset(x_np=uncal_spars, y_np=grids),
-        batch_size=batch_size, shuffle=True, num_workers=num_workers,
-        pin_memory=True, generator=torch.Generator().manual_seed(seed + 100)
+    # Load data with train/test split already done
+    (synth_fields, cal_e_fields, grids, uncal_spars,
+     synth_fields_test, cal_e_fields_test, grids_test, uncal_spars_test) = load_data(
+        file_path, seed=seed, num_synthetic_test_samples=num_synthetic_test_samples
     )
     
-    print(f"Calibrated: {len(cal_loader.dataset)} samples")
-    print(f"S param: {len(uncal_loader.dataset)} samples")
-    return cal_loader, uncal_loader
+    # Import MultiBkgDataset for training dataset
+    from MultiBkgDataset import MultiBkgDataset
+    from torch.utils.data import random_split
+    
+    # Create datasets
+    synth_dataset = MultiBkgDataset(fields=synth_fields, grids=grids, n_backgrounds=num_backgrounds)
+    synth_test_dataset = FieldsDataset(x_np=synth_fields_test, y_np=grids_test)
+    exp_dataset = FieldsDataset(x_np=cal_e_fields_test, y_np=grids_test)
+    sparam_dataset = FieldsDataset(x_np=uncal_spars_test, y_np=grids_test)
+
+    # Split train/val dataset
+    n_total = len(synth_dataset)
+    n_val = max(1, int(n_total * val_split))
+    n_train = n_total - n_val
+    g = torch.Generator().manual_seed(seed)
+    train_ds, val_ds = random_split(synth_dataset, [n_train, n_val], generator=g)
+    
+    # Create data loaders
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size//2, shuffle=False, num_workers=num_workers, pin_memory=True)
+    
+    # Deterministic shuffling for test loaders by using explicit generators
+    test_gen = torch.Generator().manual_seed(seed + 100)
+    sparam_gen = torch.Generator().manual_seed(seed + 200)
+    
+    test_loader = DataLoader(
+        exp_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        generator=test_gen,
+    )
+    synth_test_loader = DataLoader(
+        synth_test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    sparam_test_loader = DataLoader(
+        sparam_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        generator=sparam_gen,
+    )
+    
+    print(f"Training samples: {len(train_ds)}")
+    print(f"Validation samples: {len(val_ds)}")
+    print(f"Synth test samples: {len(synth_test_dataset)}")
+    print(f"Calibrated test samples: {len(exp_dataset)}")
+    print(f"S-param test samples: {len(sparam_dataset)}")
+    
+    return train_loader, val_loader, synth_test_loader, test_loader, sparam_test_loader
 
 
 def evaluate_model(model, model_type, loader, num_samples=None, device='cuda'):
     """Run model inference and collect predictions with uncertainties."""
     model.to(device).eval()
+    
+    # Enable dropout for BCNN MC sampling
+    if model_type == 'bcnn':
+        model.enable_dropout()
+    
     means, stds, targets = [], [], []
     remaining = float('inf') if num_samples is None else num_samples
     
@@ -129,6 +184,25 @@ def evaluate_model(model, model_type, loader, num_samples=None, device='cuda'):
                 bg_grid = model.bkgs.unsqueeze(0).expand(take, -1, -1, -1, -1)
                 bg_sct = model.bkg_sct_fields.unsqueeze(0).expand(take, -1, -1, -1, -1)
                 _, mean, std = model.reconstruction(x, bg_sct, bg_grid)
+            elif model_type == 'bcnn':
+                # MC Dropout sampling
+                MC_count = 15
+                predictions = []
+                variances = []
+                for k in range(MC_count):
+                    output = model(x)  # (take, 4, 100, 100)
+                    predictions.append(output[:, :2, :, :])  # mean channels
+                    variances.append(output[:, 2:, :, :])    # variance channels
+                
+                # Stack predictions
+                predictions = torch.stack(predictions)  # (MC_count, take, 2, 100, 100)
+                variances = torch.stack(variances)      # (MC_count, take, 2, 100, 100)
+                
+                # Compute mean and total uncertainty
+                mean = torch.mean(predictions, dim=0)  # (take, 2, 100, 100)
+                aleatoric = torch.mean(torch.exp(variances), dim=0)  # mean of predicted variances
+                epistemic = torch.mean((predictions - mean.unsqueeze(0))**2, dim=0)  # variance of predictions
+                std = torch.sqrt(aleatoric + epistemic)  # total uncertainty
             else:  # evidential
                 gamma, v, alpha, beta = model(x)
                 mean = gamma
@@ -145,6 +219,78 @@ def evaluate_model(model, model_type, loader, num_samples=None, device='cuda'):
                 print(f"    Processed {sum(m.shape[0] for m in means)} samples...")
     
     return np.concatenate(means), np.concatenate(stds), np.concatenate(targets)
+
+
+def compute_signal_strength(data_loader, device='cpu'):
+    """
+    Compute signal strength statistics from field data.
+    
+    Converts field data from real/imaginary representation to magnitude and phase,
+    then computes mean signal strength across all samples.
+    
+    Args:
+        data_loader: DataLoader providing field data with shape (N, 2, H, W)
+                     where channel 0 is real part and channel 1 is imaginary part
+        device: Device to perform computation on
+    
+    Returns:
+        dict: Dictionary containing signal strength statistics:
+            - 'mean_magnitude': Mean magnitude across all samples
+            - 'std_magnitude': Standard deviation of magnitudes
+            - 'max_magnitude': Maximum magnitude observed
+            - 'mean_phase': Mean phase in radians
+            - 'std_phase': Standard deviation of phases in radians
+    """
+    print("Computing signal strength statistics...")
+    
+    all_magnitudes = []
+    all_phases = []
+    
+    with torch.no_grad():
+        for batch_idx, (x, y) in enumerate(data_loader):
+            # Move to device
+            x = x.to(device)
+            y = y.to(device)
+            
+            # Process input fields (x has shape: batch_size, 2, H, W)
+            # Channel 0: real part, Channel 1: imaginary part
+            real_part = x[:, 0, :, :]  # (batch_size, H, W)
+            imag_part = x[:, 1, :, :]  # (batch_size, H, W)
+            
+            # Compute magnitude and phase
+            magnitude = torch.sqrt(real_part**2 + imag_part**2)
+            phase = torch.atan2(imag_part, real_part)
+            
+            # Store statistics
+            all_magnitudes.append(magnitude.cpu().numpy().flatten())
+            all_phases.append(phase.cpu().numpy().flatten())
+            
+            if (batch_idx + 1) % 10 == 0:
+                print(f"    Processed {batch_idx + 1} batches...")
+    
+    # Concatenate all batches
+    all_magnitudes = np.concatenate(all_magnitudes)
+    all_phases = np.concatenate(all_phases)
+    
+    # Compute statistics
+    stats = {
+        'mean_magnitude': np.mean(all_magnitudes),
+        'std_magnitude': np.std(all_magnitudes),
+        'max_magnitude': np.max(all_magnitudes),
+        'median_magnitude': np.median(all_magnitudes),
+        'mean_phase': np.mean(all_phases),
+        'std_phase': np.std(all_phases),
+    }
+    
+    print(f"\nSignal Strength Statistics:")
+    print(f"  Mean Magnitude: {stats['mean_magnitude']:.4e}")
+    print(f"  Std Magnitude:  {stats['std_magnitude']:.4e}")
+    print(f"  Max Magnitude:  {stats['max_magnitude']:.4e}")
+    print(f"  Median Magnitude: {stats['median_magnitude']:.4e}")
+    print(f"  Mean Phase:     {stats['mean_phase']:.4f} rad")
+    print(f"  Std Phase:      {stats['std_phase']:.4f} rad")
+    
+    return stats
 
 
 def plot_calibration_curve(results_dict, output_path, title='Calibration Curve'):
@@ -195,6 +341,225 @@ def print_metrics(mean, std, targets, label):
     print('='*70)
 
 
+def run_experiment(models, model_types, model_names, test_loader, experiment_name, output_dir, 
+                   max_figures=10, device='cuda', noise_std=0):
+    """
+    Run an experiment: evaluate models on test data and save visualization figures.
+    
+    Args:
+        models: List of PyTorch Lightning models to evaluate
+        model_types: List of model type strings ('mbkg', 'bcnn', 'evidential')
+        model_names: List of display names for each model
+        test_loader: DataLoader providing test (x, y) pairs
+        experiment_name: Name of experiment (used for folder naming)
+        output_dir: Base output directory for saving figures
+        max_figures: Maximum number of sample figures to save
+        device: Device to run inference on
+        noise_std: Standard deviation of noise to inject into inputs
+
+    Returns:
+        results_dict: Dictionary mapping model names to (mean, std, targets) tuples
+    """
+    print(f"\n{'='*70}\n{experiment_name}\n{'='*70}")
+    
+    # Create experiment output directory
+    exp_output_dir = os.path.join(output_dir, experiment_name.lower().replace(' ', '_'))
+    os.makedirs(exp_output_dir, exist_ok=True)
+    
+    results_dict = {}
+    all_model_results = []  # Store results for all models
+    
+    for model, model_type, model_name in zip(models, model_types, model_names):
+        print(f"\n--- {model_name} ---")
+        
+        model.to(device).eval()
+        
+        # Enable dropout for BCNN MC sampling
+        if model_type == 'bcnn':
+            model.enable_dropout()
+        
+        all_inputs = []
+        all_means = []
+        all_stds = []
+        all_targets = []
+        
+        # Run inference on test data
+        with torch.no_grad():
+            for batch_idx, (x, y) in enumerate(test_loader):
+                x, y = x.to(device), y.to(device)
+
+                noise = torch.randn_like(x) * noise_std
+                x = x + noise
+
+                # Get predictions and uncertainty based on model type
+                if model_type == 'mbkg':
+                    B = x.shape[0]
+                    bg_grid = model.bkgs.unsqueeze(0).expand(B, -1, -1, -1, -1)
+                    bg_sct = model.bkg_sct_fields.unsqueeze(0).expand(B, -1, -1, -1, -1)
+                    _, mean, std = model.reconstruction(x, bg_sct, bg_grid)
+                elif model_type == 'bcnn':
+                    # MC Dropout sampling
+                    MC_count = 15
+                    predictions = []
+                    variances = []
+                    for k in range(MC_count):
+                        output = model(x)  # (B, 4, 100, 100)
+                        predictions.append(output[:, :2, :, :])  # mean channels
+                        variances.append(output[:, 2:, :, :])    # variance channels
+                    
+                    # Stack predictions
+                    predictions = torch.stack(predictions)  # (MC_count, B, 2, 100, 100)
+                    variances = torch.stack(variances)      # (MC_count, B, 2, 100, 100)
+                    
+                    # Compute mean and total uncertainty
+                    mean = torch.mean(predictions, dim=0)  # (B, 2, 100, 100)
+                    aleatoric = torch.mean(torch.exp(variances), dim=0)  # mean of predicted variances
+                    epistemic = torch.mean((predictions - mean.unsqueeze(0))**2, dim=0)  # variance of predictions
+                    std = torch.sqrt(aleatoric + epistemic)  # total uncertainty
+                else:  # evidential
+                    gamma, v, alpha, beta = model(x)
+                    mean = gamma
+                    std = torch.sqrt(beta / (alpha - 1 + 1e-10) + beta / (v * (alpha - 1) + 1e-10))
+                
+                all_inputs.append(x.cpu())
+                all_means.append(mean.cpu())
+                all_stds.append(std.cpu())
+                all_targets.append(y.cpu())
+        
+        # Concatenate all batches
+        all_inputs = torch.cat(all_inputs, dim=0)
+        all_means = torch.cat(all_means, dim=0)
+        all_stds = torch.cat(all_stds, dim=0)
+        all_targets = torch.cat(all_targets, dim=0)
+        
+        print(f"  Processed {len(all_inputs)} samples")
+        
+        # Convert to numpy for statistics computation
+        means_np = all_means.numpy()
+        stds_np = all_stds.numpy()
+        targets_np = all_targets.numpy()
+        
+        # Compute statistics for this model (for summary at end)
+        mse_per_sample = np.mean((means_np - targets_np)**2, axis=(1, 2, 3))
+        overall_mse = np.mean((means_np - targets_np)**2)
+        mae = np.mean(np.abs(means_np - targets_np))
+        correlation, p_value = error_std_correlation(means_np, stds_np, targets_np)
+        expected_calibration_error_value = expected_calibration_error(means_np, stds_np, targets_np)
+        
+        # Save results for later analysis
+        results_dict[model_name] = (
+            means_np,
+            stds_np,
+            targets_np
+        )
+        
+        # Store results for combined visualization
+        all_model_results.append({
+            'name': model_name,
+            'inputs': all_inputs,
+            'means': all_means,
+            'stds': all_stds,
+            'targets': all_targets,
+            'mse_per_sample': mse_per_sample,
+            'overall_mse': overall_mse,
+            'mae': mae,
+            'correlation': correlation,
+            'expected_calibration_error': expected_calibration_error_value
+        })
+    # Create combined figures: one figure per sample, all models in rows
+    num_models = len(models)
+    num_figs_to_save = min(max_figures, len(all_model_results[0]['inputs']))
+    print(f"\n  Saving {num_figs_to_save} combined visualization figures to {exp_output_dir}")
+    
+    for sample_idx in range(num_figs_to_save):
+        # Create figure: rows = models, columns = GT, Pred, Std, Abs Error
+        fig, axes = plt.subplots(num_models, 4, figsize=(16, 4 * num_models))
+        
+        # Handle case of single model
+        if num_models == 1:
+            axes = axes.reshape(1, -1)
+        
+        # First pass: collect all data and compute global min/max for color scales
+        all_targets = []
+        all_preds = []
+        all_stds = []
+        all_errs = []
+        
+        for model_result in all_model_results:
+            target = model_result['targets'][sample_idx, 0]  # Real channel only
+            pred = model_result['means'][sample_idx, 0]      # Real channel only
+            std = model_result['stds'][sample_idx, 0]        # Real channel only
+            abs_err = torch.abs(pred - target)
+            
+            all_targets.append(target)
+            all_preds.append(pred)
+            all_stds.append(std)
+            all_errs.append(abs_err)
+        
+        # Compute global min/max for columns 0-1 (GT and Pred share same scale)
+        gt_pred_min = min(torch.min(t).item() for t in all_targets + all_preds)
+        gt_pred_max = max(torch.max(t).item() for t in all_targets + all_preds)
+        
+        # Compute global min/max for column 2 (Uncertainty)
+        std_min = min(torch.min(s).item() for s in all_stds)
+        std_max = max(torch.max(s).item() for s in all_stds)
+        
+        # Compute global min/max for column 3 (Abs Error)
+        err_min = min(torch.min(e).item() for e in all_errs)
+        err_max = max(torch.max(e).item() for e in all_errs)
+        
+        def show(ax, tensor2d, title, cmap='viridis', vmin=None, vmax=None):
+            im = ax.imshow(tensor2d, cmap=cmap, vmin=vmin, vmax=vmax)
+            ax.set_title(title, fontsize=10)
+            ax.axis('off')
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        
+        # Second pass: plot with synced color scales
+        for model_idx, model_result in enumerate(all_model_results):
+            model_name = model_result['name']
+            
+            # Column 0: Ground Truth (synced with Pred)
+            show(axes[model_idx, 0], all_targets[model_idx], f'{model_name}\nGT (Real)', 
+                 cmap='viridis', vmin=gt_pred_min, vmax=gt_pred_max)
+            
+            # Column 1: Prediction (synced with GT)
+            show(axes[model_idx, 1], all_preds[model_idx], 'Prediction (Real)', 
+                 cmap='viridis', vmin=gt_pred_min, vmax=gt_pred_max)
+            
+            # Column 2: Uncertainty (synced across models)
+            show(axes[model_idx, 2], all_stds[model_idx], 'Uncertainty (Real)', 
+                 cmap='plasma')
+            
+            # Column 3: Absolute Error (synced across models)
+            show(axes[model_idx, 3], all_errs[model_idx], 'Abs Error (Real)', 
+                 cmap='magma', vmin=err_min, vmax=err_max)
+        
+        plt.suptitle(f'{experiment_name} - Sample {sample_idx}', fontsize=14, y=0.995)
+        plt.tight_layout()
+        plt.savefig(os.path.join(exp_output_dir, f'sample_{sample_idx:03d}.pdf'), dpi=150, bbox_inches='tight')
+        plt.close(fig)
+    
+    # Print comparative summary of all models
+    print(f"\n{'='*70}")
+    print(f"COMPARATIVE SUMMARY - {experiment_name}")
+    print(f"{'='*70}")
+    print(f"{'Model':<30} {'MSE':<15} {'MAE':<15} {'Corr':<10} {'ECE':<10}")
+    print(f"{'-'*70}")
+    for model_result in all_model_results:
+        model_name = model_result['name']
+        mse = model_result['overall_mse']
+        mae = model_result['mae']
+        corr = model_result['correlation']
+        ece = model_result['expected_calibration_error']
+        print(f"{model_name:<30} {mse:<15.6e} {mae:<15.6e} {corr:<10.4f} {ece:<10.4f}")
+    print(f"{'='*70}\n")
+    
+    print(f"\n✓ Experiment complete: {experiment_name}")
+    print(f"  Figures saved to: {exp_output_dir}")
+    
+    return results_dict
+
+
 def main():
     # ========================================================================
     # Configuration - Just provide experiment names!
@@ -202,8 +567,12 @@ def main():
     EXPERIMENT_NAMES = [
         "mbg_train_synth_test_cal_exp_25bkgs",
         "evidential_experiment",
+        "bcnn_experiment_800"
     ]
-    MODEL_TYPES = None  # Auto-detect, or specify ['mbkg', 'evidential']
+    MODEL_TYPES = [
+        "mbkg",
+        "evidential",
+        "bcnn"]
     DATA_FILE = "all_data.mat"
     OUTPUT_DIR = "figures/calibration_eval"
     BATCH_SIZE = 16
@@ -236,67 +605,111 @@ def main():
     models, model_types = load_models(checkpoint_paths, MODEL_TYPES)
     
     print("\n" + "="*70 + "\nBUILDING DATA LOADERS\n" + "="*70)
-    cal_loader, uncal_loader = build_data_loaders(DATA_FILE, BATCH_SIZE, NUM_WORKERS, SEED)
-    
-    # ========================================================================
-    # Evaluate models
-    # ========================================================================
-    print("\n" + "="*70 + "\nEVALUATING MODELS\n" + "="*70)
-    
-    all_cal_results = {}
-    all_uncal_results = {}
-    
-    for idx, (model, model_type) in enumerate(zip(models, model_types)):
-        model_name = f"Model{idx+1}_{model_type}"
-        print(f"\n--- {model_name} ---")
-        
-        # Calibrated data
-        print("  Evaluating on calibrated data...")
-        mean_cal, std_cal, targets_cal = evaluate_model(model, model_type, cal_loader, NUM_SAMPLES, DEVICE)
-        all_cal_results[model_name] = (mean_cal, std_cal, targets_cal)
-        
-        # Individual plot
-        plot_calibration_curve(
-            {model_name: (mean_cal, std_cal, targets_cal)},
-            os.path.join(OUTPUT_DIR, f"{model_name}_calibrated.pdf"),
-            f"{model_name} - Calibrated Data"
-        )
-        print_metrics(mean_cal, std_cal, targets_cal, f"{model_name} - Calibrated")
-        
-        # Uncalibrated data
-        print("  Evaluating on uncalibrated data...")
-        mean_uncal, std_uncal, targets_uncal = evaluate_model(model, model_type, uncal_loader, NUM_SAMPLES, DEVICE)
-        all_uncal_results[model_name] = (mean_uncal, std_uncal, targets_uncal)
-        
-        # Individual plot
-        plot_calibration_curve(
-            {model_name: (mean_uncal, std_uncal, targets_uncal)},
-            os.path.join(OUTPUT_DIR, f"{model_name}_uncalibrated.pdf"),
-            f"{model_name} - Uncalibrated Data"
-        )
-        print_metrics(mean_uncal, std_uncal, targets_uncal, f"{model_name} - Uncalibrated")
-    
-    # ========================================================================
-    # Generate comparison plots
-    # ========================================================================
-    if len(models) > 1:
-        print("\n" + "="*70 + "\nGENERATING COMPARISON PLOTS\n" + "="*70)
-        plot_calibration_curve(all_cal_results, os.path.join(OUTPUT_DIR, "comparison_calibrated.pdf"),
-                              "Calibration Curves - Calibrated Data")
-        plot_calibration_curve(all_uncal_results, os.path.join(OUTPUT_DIR, "comparison_uncalibrated.pdf"),
-                              "Calibration Curves - Uncalibrated Data")
-    
-    # Compare cal vs uncal for each model
-    for idx in range(len(models)):
-        model_name = f"Model{idx+1}_{model_types[idx]}"
-        plot_calibration_curve(
-            {"Calibrated": all_cal_results[model_name], "Uncalibrated": all_uncal_results[model_name]},
-            os.path.join(OUTPUT_DIR, f"{model_name}_cal_vs_uncal.pdf"),
-            f"{model_name}: Calibrated vs Uncalibrated"
-        )
-    
-    print("\n" + "="*70 + f"\nDONE! Results saved to: {OUTPUT_DIR}\n" + "="*70)
+    train_loader, val_loader, synth_test_loader, cal_loader, uncal_loader = build_data_loaders(
+        DATA_FILE, BATCH_SIZE, NUM_WORKERS, SEED
+    )
 
+    # Compute signal strength for scaling noise
+    signal_details = compute_signal_strength(synth_test_loader)
+    signal_std = signal_details['mean_magnitude']
+
+    # ========================================================================
+    # Evaluate models - Repeat experiments each for different data
+    # ========================================================================
+
+    # ========================================================================
+    # Experiment 1 - Synth test set
+    # ========================================================================
+    results_dict = run_experiment(
+        models, model_types, EXPERIMENT_NAMES,
+        synth_test_loader,
+        experiment_name="Experiment 1 - Synth Test Set",
+        output_dir="figures",
+        max_figures=10,
+        device=DEVICE
+    )
+
+    # ========================================================================
+    # Experiment 2 - 10% noise injected into synthetic fields
+    # ========================================================================
+    noise_std = 0.1 * signal_std
+    results_dict = run_experiment(
+        models, model_types, EXPERIMENT_NAMES,
+        synth_test_loader,
+        experiment_name="Experiment 2 - 10% Noise",
+        output_dir="figures",
+        max_figures=10,
+        device=DEVICE,
+        noise_std=noise_std
+    )
+
+    # ========================================================================
+    # Experiment 3 - 20% noise injected into synthetic fields
+    # ========================================================================
+    noise_std = 0.2 * signal_std
+    results_dict = run_experiment(
+        models, model_types, EXPERIMENT_NAMES,
+        synth_test_loader,
+        experiment_name="Experiment 3 - 20% Noise",
+        output_dir="figures",
+        max_figures=10,
+        device=DEVICE,
+        noise_std=noise_std
+    )
+
+    # ========================================================================
+    # Experiment 4 - 40% noise injected into synthetic fields
+    # ========================================================================
+    noise_std = 0.4 * signal_std
+    results_dict = run_experiment(
+        models, model_types, EXPERIMENT_NAMES,
+        synth_test_loader,
+        experiment_name="Experiment 4 - 40% Noise",
+        output_dir="figures",
+        max_figures=10,
+        device=DEVICE,
+        noise_std=noise_std
+    )
+
+    # ========================================================================
+    # Experiment 4.5 - 100% noise injected into synthetic fields
+    # ========================================================================
+    noise_std = 1.0 * signal_std
+    results_dict = run_experiment(
+        models, model_types, EXPERIMENT_NAMES,
+        synth_test_loader,
+        experiment_name="Experiment 4.5 - 100% Noise",
+        output_dir="figures",
+        max_figures=10,
+        device=DEVICE,
+        noise_std=noise_std
+    )
+
+    # ========================================================================
+    # Experiment 5 - Calibrated E-field test set
+    # ========================================================================
+    results_dict = run_experiment(
+        models, model_types, EXPERIMENT_NAMES,
+        cal_loader,
+        experiment_name="Experiment 5 - Calibrated E-field Test Set",
+        output_dir="figures",
+        max_figures=10,
+        device=DEVICE,
+    )
+
+    # ========================================================================
+    # Experiment 5 - Calibrated E-field test set with 100% noise
+    # ========================================================================
+    noise_std = 1.0 * signal_std
+    results_dict = run_experiment(
+        models, model_types, EXPERIMENT_NAMES,
+        cal_loader,
+        experiment_name="Experiment 5 - Calibrated E-field Test Set with 100% Noise",
+        output_dir="figures",
+        max_figures=10,
+        device=DEVICE,
+        noise_std=signal_std,
+    )
 
 if __name__ == "__main__":
     main()
