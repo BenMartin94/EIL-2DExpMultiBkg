@@ -77,8 +77,31 @@ def wei_ece(mean, std, targets):
         in_bin = (pj_flat > lower) & (pj_flat <= upper)
         Sl_delta = np.where(in_bin)[0]
         Sl_list.append(Sl_delta)
-        
-        
+        # now average of pjs in Sl_delta
+        if len(Sl_delta) > 0:
+            cred = np.mean(pj_flat[Sl_delta])
+        else:
+            cred = 0
+        creds.append(cred)
+
+        # now find accuracy in Sl_delta
+    accs = []
+    for Sl_delta in Sl_list:
+        if len(Sl_delta) > 0:
+            correct = 0
+            for idx in Sl_delta:
+                # check if target is within mean ± dirac_delta
+                if (targets.reshape(-1)[idx] >= (mean.reshape(-1)[idx] - dirac_delta)) and (targets.reshape(-1)[idx] <= (mean.reshape(-1)[idx] + dirac_delta)):
+                    correct += 1
+            acc = correct / len(Sl_delta)
+        else:
+            acc = 0
+        accs.append(acc)
+    M = len(mean.reshape(-1))
+    ece = 0
+    for i in range(L - 1):
+        ece += (len(Sl_list[i]) / M) * np.abs(creds[i] - accs[i])
+    return creds, accs
 
 
 def sharpness(std):
