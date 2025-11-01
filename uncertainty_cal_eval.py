@@ -98,7 +98,7 @@ def wei_ece(mean, std, targets):
         accs.append(acc)
     M = len(mean.reshape(-1))
     ece = 0
-    for i in range(L - 1):
+    for i in range(L):
         ece += (len(Sl_list[i]) / M) * np.abs(creds[i] - accs[i])
     return ece
 

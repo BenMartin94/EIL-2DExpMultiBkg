@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 
 from Unet import UNet, bayesian_loss
 import main as data_main
-from MultiBkgDataset import MultiBkgDataset
+from MultiBkgDataset import LimitedExampleMultiBkgDataset, MultiBkgDataset
 from Litmus_test import litmus_test
 from data_loader import load_data, FieldsDataset
 from uncertainty_cal_eval import error_std_correlation
@@ -37,8 +37,7 @@ class LitUNet(pl.LightningModule):
         # Save hyperparameters, ignoring large tensors.
         self.save_hyperparameters(ignore=['bkgs', 'bkg_sct_fields'])
         self.model = UNet(in_channels=in_channels, out_channels=out_channels, base_channels=base_channels)
-        self.criterion = bayesian_loss
-        #self.criterion = torch.nn.MSELoss()
+        self.criterion = torch.nn.MSELoss()  # Use this for standard UNet with 2 output channels
         self.experiment_tag = experiment_tag
 
         # Register buffers. They will be populated from the checkpoint if loading.
@@ -165,11 +164,10 @@ class LitUNet(pl.LightningModule):
         bg_grid_complex = bg_grid[:, :, 0] + 1j * bg_grid[:, :, 1]
         fg_grid_complex = pred_contrast_complex * bg_grid_complex + bg_grid_complex
         fg_grid = torch.stack([fg_grid_complex.real, fg_grid_complex.imag], dim=2)  # (B,nbkgs,2,100,100)
-        pred_vars = pred_contrast_grid[:, :, 2:]  # (B,nbkgs,2,100,100) currently unused
 
         if nbkgs == 1:
             # If only one background, no need to compute weighted stats
-            return fg_grid, fg_grid[:, 0], pred_vars[:, 0]
+            return fg_grid, fg_grid[:, 0], None
 
         # Unweighted stats (kept for backward compatibility)
         fg_grid_mu = fg_grid.mean(dim=1)  # (B,2,100,100)
@@ -459,12 +457,13 @@ class LitUNet(pl.LightningModule):
                     'reconstruction/mean_reconstruction_real', mean_recon_real_norm, self.current_epoch
                 )
                 
-                # Log standard deviation of reconstructions (real part)
-                std_recon_real = torch.stack([fg_grid_std[i, 0].cpu().unsqueeze(0) for i in range(n_examples)])
-                std_recon_real_norm = normalize_for_tensorboard(std_recon_real)
-                self.logger.experiment.add_images(
-                    'reconstruction/std_reconstruction_real', std_recon_real_norm, self.current_epoch
-                )
+                # Log standard deviation of reconstructions (real part) - only if available
+                if fg_grid_std is not None:
+                    std_recon_real = torch.stack([fg_grid_std[i, 0].cpu().unsqueeze(0) for i in range(n_examples)])
+                    std_recon_real_norm = normalize_for_tensorboard(std_recon_real)
+                    self.logger.experiment.add_images(
+                        'reconstruction/std_reconstruction_real', std_recon_real_norm, self.current_epoch
+                    )
                 
                 # Log individual reconstructions for first background (real part)
                 first_bg_recon_real = torch.stack([fg_grid_reconstructed[i, 0, 0].cpu().unsqueeze(0) for i in range(n_examples)])
@@ -487,12 +486,13 @@ class LitUNet(pl.LightningModule):
                     'reconstruction/mean_reconstruction_imag', mean_recon_imag_norm, self.current_epoch
                 )
                 
-                # Log standard deviation of reconstructions (imaginary part)
-                std_recon_imag = torch.stack([fg_grid_std[i, 1].cpu().unsqueeze(0) for i in range(n_examples)])
-                std_recon_imag_norm = normalize_for_tensorboard(std_recon_imag)
-                self.logger.experiment.add_images(
-                    'reconstruction/std_reconstruction_imag', std_recon_imag_norm, self.current_epoch
-                )
+                # Log standard deviation of reconstructions (imaginary part) - only if available
+                if fg_grid_std is not None:
+                    std_recon_imag = torch.stack([fg_grid_std[i, 1].cpu().unsqueeze(0) for i in range(n_examples)])
+                    std_recon_imag_norm = normalize_for_tensorboard(std_recon_imag)
+                    self.logger.experiment.add_images(
+                        'reconstruction/std_reconstruction_imag', std_recon_imag_norm, self.current_epoch
+                    )
             
             # Create comparison figure showing original vs reconstructed vs mean vs std
             fig, axes = plt.subplots(n_examples, 4, figsize=(16, 4 * n_examples))
@@ -512,9 +512,14 @@ class LitUNet(pl.LightningModule):
                 axes[i, 2].imshow(fg_grid_reconstructed[i, 0, 0].cpu(), cmap="viridis")
                 axes[i, 2].set_title("First BG Recon (real)")
                 
-                # Standard deviation (real part)
-                axes[i, 3].imshow(fg_grid_std[i, 0].cpu(), cmap="plasma")
-                axes[i, 3].set_title("Std Dev (real)")
+                # Standard deviation (real part) - only if available
+                if fg_grid_std is not None:
+                    axes[i, 3].imshow(fg_grid_std[i, 0].cpu(), cmap="plasma")
+                    axes[i, 3].set_title("Std Dev (real)")
+                else:
+                    # If no std available, show a placeholder
+                    axes[i, 3].text(0.5, 0.5, 'N/A', ha='center', va='center', transform=axes[i, 3].transAxes)
+                    axes[i, 3].set_title("Std Dev (N/A)")
                 
                 for j in range(4):
                     axes[i, j].axis("off")
@@ -531,11 +536,14 @@ class LitUNet(pl.LightningModule):
                 # Compute reconstruction error metrics
                 recon_mae = torch.mean(torch.abs(fg_grid_mean - fg_grid))
                 recon_mse = torch.mean((fg_grid_mean - fg_grid) ** 2)
-                recon_mean_std = torch.mean(fg_grid_std)
                 
                 self.log("recon_mae", recon_mae, on_step=False, on_epoch=True)
                 self.log("recon_mse", recon_mse, on_step=False, on_epoch=True)
-                self.log("recon_mean_std", recon_mean_std, on_step=False, on_epoch=True)
+                
+                # Only log std metrics if available (requires multiple backgrounds)
+                if fg_grid_std is not None:
+                    recon_mean_std = torch.mean(fg_grid_std)
+                    self.log("recon_mean_std", recon_mean_std, on_step=False, on_epoch=True)
                 
                 # Log per-channel reconstruction metrics
                 for c in range(fg_grid.shape[1]):
@@ -599,10 +607,24 @@ def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers:
     exp_dataset = FieldsDataset(x_np=cal_e_fields, y_np=grids)
     sparam_dataset = FieldsDataset(x_np=uncal_spars, y_np=grids)
     n_total = len(synth_dataset)
-    n_val = max(1, int(n_total * val_split))
-    n_train = n_total - n_val
-    g = torch.Generator().manual_seed(seed)
-    train_ds, val_ds = random_split(synth_dataset, [n_train, n_val], generator=g)
+    
+    # Handle small datasets: if dataset is too small for a split, use all for training
+    if n_total < 5:
+        print(f"Warning: Dataset size ({n_total}) is very small. Using all data for training, validation will use the same data.")
+        n_train = n_total
+        n_val = n_total
+        g = torch.Generator().manual_seed(seed)
+        train_ds = synth_dataset
+        val_ds = synth_dataset
+    else:
+        n_val = max(1, int(n_total * val_split))
+        n_train = n_total - n_val
+        # Ensure at least 1 sample in training
+        if n_train < 1:
+            n_train = 1
+            n_val = n_total - 1
+        g = torch.Generator().manual_seed(seed)
+        train_ds, val_ds = random_split(synth_dataset, [n_train, n_val], generator=g)
 
     # If steps_per_epoch is specified, create a custom sampler that repeats/limits data
     if steps_per_epoch is not None:
@@ -909,8 +931,8 @@ def main():
     parser.add_argument("--debug-recon", action="store_true", help="Run a single debug reconstruction before training")
     parser.add_argument("--test-only", action="store_true", help="Skip training and run test on a checkpoint.")
     parser.add_argument("--ckpt-path", type=str, default=None, help="Path to checkpoint for testing. If None, finds latest.")
-    parser.add_argument("--experiment-tag", type=str, default="mbg_train_synth_test_cal_exp_25bkgs", help="Tag for experiment (used in logging)")
-    parser.add_argument("--num-backgrounds", type=int, default=1, help="Number of backgrounds to use from training dataset")
+    parser.add_argument("--experiment-tag", type=str, default="mbg_train_synth_test_cal_exp_25bkgs_1fg", help="Tag for experiment (used in logging)")
+    parser.add_argument("--num-backgrounds", type=int, default=25, help="Number of backgrounds to use from training dataset")
     parser.add_argument("--steps-per-epoch", type=int, default=None, help="Number of training steps per epoch. If None, uses full dataset. Data will be reused if this exceeds dataset size.")
 
     args = parser.parse_args()
@@ -941,7 +963,7 @@ def main():
             bkgs=bg_grids_tensor,
             bkg_sct_fields=bg_fields_tensor,
             in_channels=2,
-            out_channels=4,
+            out_channels=2,
             base_channels=args.base_channels,
             lr=args.lr,
             experiment_tag=EXPERIMENT_TAG

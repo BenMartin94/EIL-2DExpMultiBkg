@@ -444,7 +444,7 @@ def test(
 def main():
     parser = argparse.ArgumentParser(description="Train BCNN UNet for EM field reconstruction")
     parser.add_argument("--data", type=str, default="all_data.mat", help="Path to .mat file")
-    parser.add_argument("--epochs", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=800)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--base-channels", type=int, default=64)

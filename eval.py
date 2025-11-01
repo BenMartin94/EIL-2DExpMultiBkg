@@ -17,7 +17,7 @@ from data_loader import load_data, FieldsDataset
 from train import LitUNet
 from train_evidential import LitEvidentialUNet
 from train_bcnn import LitBCNNUNet
-from uncertainty_cal_eval import calibration_curve, expected_calibration_error, confidence_interval_coverage, error_std_correlation
+from uncertainty_cal_eval import calibration_curve, expected_calibration_error, confidence_interval_coverage, error_std_correlation, wei_ece
 
 
 def find_latest_checkpoint(experiment_name):
@@ -444,7 +444,7 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
         overall_mse = np.mean((means_np - targets_np)**2)
         mae = np.mean(np.abs(means_np - targets_np))
         correlation, p_value = error_std_correlation(means_np, stds_np, targets_np)
-        expected_calibration_error_value = expected_calibration_error(means_np, stds_np, targets_np)
+        expected_calibration_error_value = wei_ece(means_np, stds_np, targets_np)
         
         # Save results for later analysis
         results_dict[model_name] = (
@@ -528,7 +528,7 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
             
             # Column 2: Uncertainty (synced across models)
             show(axes[model_idx, 2], all_stds[model_idx], 'Uncertainty (Real)', 
-                 cmap='plasma')
+                 cmap='plasma', vmin=std_min, vmax=std_max)
             
             # Column 3: Absolute Error (synced across models)
             show(axes[model_idx, 3], all_errs[model_idx], 'Abs Error (Real)', 
@@ -696,11 +696,10 @@ def main():
         max_figures=10,
         device=DEVICE,
     )
-
     # ========================================================================
     # Experiment 5 - Calibrated E-field test set with 100% noise
     # ========================================================================
-    noise_std = 1.0 * signal_std
+    
     results_dict = run_experiment(
         models, model_types, EXPERIMENT_NAMES,
         cal_loader,
@@ -708,8 +707,9 @@ def main():
         output_dir="figures",
         max_figures=10,
         device=DEVICE,
-        noise_std=signal_std,
+        noise_std=1.0 * signal_std
     )
+    
 
 if __name__ == "__main__":
     main()
