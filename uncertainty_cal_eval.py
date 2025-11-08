@@ -63,6 +63,19 @@ def expected_calibration_error(mean, std, targets, pis=None):
     return ece
 
 def wei_ece(mean, std, targets):
+    """
+    Compute Weighted Expected Calibration Error (WEI-ECE).
+    
+    Args:
+        mean (np.ndarray): predicted means
+        std (np.ndarray): predicted standard deviations
+        targets (np.ndarray): ground truth values
+    
+    Returns:
+        ece (float): Weighted Expected Calibration Error
+        creds (np.ndarray): credibility values (expected confidence per bin)
+        accs (np.ndarray): accuracy values (observed accuracy per bin)
+    """
     dirac_delta = 0.05
     pj = norm.cdf(mean + dirac_delta, loc=mean, scale=std) - norm.cdf(mean - dirac_delta, loc=mean, scale=std)
     pj_flat = pj.reshape(-1)
@@ -100,7 +113,8 @@ def wei_ece(mean, std, targets):
     ece = 0
     for i in range(L):
         ece += (len(Sl_list[i]) / M) * np.abs(creds[i] - accs[i])
-    return ece
+    
+    return ece, np.array(creds), np.array(accs)
 
 
 def sharpness(std):
@@ -201,7 +215,7 @@ def test_wei_ece():
         mean = targets + np.random.randn(n_samples)*0.2
         std = np.ones(n_samples) * std_mag
 
-        ece = wei_ece(mean, std, targets)
+        ece, creds, accs = wei_ece(mean, std, targets)
         print(f"Std mag: {std_mag:.2f}, WEI-ECE: {ece:.4f}")
 
 def test_correlation_coeff():

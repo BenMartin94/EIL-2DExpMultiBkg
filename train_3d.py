@@ -277,8 +277,9 @@ def build_3d_loaders(
 
 def save_orthogonal_slices(target_vol: np.ndarray, pred_vol: np.ndarray, std_vol: np.ndarray, output_path: str):
     """
-    Saves a 3x4 grid of orthogonal slices (axial, coronal, sagittal) for
-    target, prediction, absolute difference, and reconstruction std dev.
+    Saves a 3x4 grid showing 3 slices along the last axis (W/X).
+    Rows: 3 different slice positions along the last axis
+    Columns: GT, Pred, Diff, Std
     """
     import matplotlib.pyplot as plt
 
@@ -288,49 +289,52 @@ def save_orthogonal_slices(target_vol: np.ndarray, pred_vol: np.ndarray, std_vol
     std_vol = np.squeeze(std_vol)
     diff_vol = np.abs(target_vol - pred_vol)
 
-    # Get center slice indices
+    # Get dimensions
     d, h, w = target_vol.shape
-    d_slice, h_slice, w_slice = d // 2, h // 2, w // 2
+    
+    # Select 3 slice indices along the last axis (W): 1/4, 1/2, 3/4
+    slice_indices = [w // 4, w // 2, 3 * w // 4]
 
     # Create a figure
     fig, axs = plt.subplots(3, 4, figsize=(16, 12), facecolor='w')
-    fig.suptitle('Orthogonal Slices of 3D Validation Sample', fontsize=15)
-
-    # Define what to plot
-    slice_data = {
-        "Axial (Z)": (target_vol[d_slice, :, :], pred_vol[d_slice, :, :], diff_vol[d_slice, :, :], std_vol[d_slice, :, :]),
-        "Coronal (Y)": (target_vol[:, h_slice, :], pred_vol[:, h_slice, :], diff_vol[:, h_slice, :], std_vol[:, h_slice, :]),
-        "Sagittal (X)": (target_vol[:, :, w_slice], pred_vol[:, :, w_slice], diff_vol[:, :, w_slice], std_vol[:, :, w_slice]),
-    }
+    fig.suptitle('Slices Along Last Axis (X) of 3D Validation Sample', fontsize=15)
 
     # Plot the data
-    for i, (title, (t_slice, p_slice, d_slice, s_slice)) in enumerate(slice_data.items()):
+    for i, w_idx in enumerate(slice_indices):
+        # Extract slices along the last axis: [:, :, w_idx]
+        t_slice = target_vol[:, :, w_idx]
+        p_slice = pred_vol[:, :, w_idx]
+        d_slice = diff_vol[:, :, w_idx]
+        s_slice = std_vol[:, :, w_idx]
+        
         # Determine shared color range for target and prediction
         vmin = min(t_slice.min(), p_slice.min())
         vmax = max(t_slice.max(), p_slice.max())
 
-        axs[i, 0].imshow(t_slice, cmap='viridis', vmin=vmin, vmax=vmax)
-        axs[i, 0].set_title(f"{title} - Target")
+        im0 = axs[i, 0].imshow(t_slice, cmap='viridis', vmin=vmin, vmax=vmax)
+        axs[i, 0].set_title(f"Slice {w_idx}/{w} - GT")
         axs[i, 0].axis('off')
+        fig.colorbar(im0, ax=axs[i, 0], fraction=0.046, pad=0.04)
 
-        axs[i, 1].imshow(p_slice, cmap='viridis', vmin=vmin, vmax=vmax)
-        axs[i, 1].set_title(f"{title} - Prediction")
+        im1 = axs[i, 1].imshow(p_slice, cmap='viridis', vmin=vmin, vmax=vmax)
+        axs[i, 1].set_title(f"Slice {w_idx}/{w} - Pred")
         axs[i, 1].axis('off')
+        fig.colorbar(im1, ax=axs[i, 1], fraction=0.046, pad=0.04)
 
-        im = axs[i, 2].imshow(d_slice, cmap='magma')
-        axs[i, 2].set_title(f"{title} - Abs Difference")
+        im_s = axs[i, 2].imshow(s_slice, cmap='plasma')
+        axs[i, 2].set_title(f"Slice {w_idx}/{w} - Std")
         axs[i, 2].axis('off')
-        fig.colorbar(im, ax=axs[i, 2], fraction=0.046, pad=0.04)
+        fig.colorbar(im_s, ax=axs[i, 2], fraction=0.046, pad=0.04)
 
-        im_s = axs[i, 3].imshow(s_slice, cmap='plasma')
-        axs[i, 3].set_title(f"{title} - Std Dev")
+        im = axs[i, 3].imshow(d_slice, cmap='magma')
+        axs[i, 3].set_title(f"Slice {w_idx}/{w} - Error")
         axs[i, 3].axis('off')
-        fig.colorbar(im_s, ax=axs[i, 3], fraction=0.046, pad=0.04)
+        fig.colorbar(im, ax=axs[i, 3], fraction=0.046, pad=0.04)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(output_path, dpi=150)
     plt.close()
-    print(f"\n--- Orthogonal slice plot saved to: {output_path} ---")
+    print(f"\n--- Slice plot saved to: {output_path} ---")
 
 
 def main():
@@ -535,7 +539,7 @@ def main():
                 alpha=[0, 0.2, 0.4, 0.7, 1.0],
                 show_axes=True,
                 background="white",
-                vmin=0.15
+                vmin=0.2
             )
             
             # Render absolute difference

@@ -66,7 +66,7 @@ def render_volume(
     
     # Create PyVista ImageData from numpy array
     grid = pv.ImageData(dimensions=volume.shape)
-    grid["scalars"] = volume.flatten(order="F")
+    grid[""] = volume.flatten(order="F")  # Empty string to avoid label on colorbar
     
     # Determine clim for colormap
     if vmin is None:
@@ -80,9 +80,9 @@ def render_volume(
     
     # Add volume with optional opacity
     if alpha is not None:
-        _ = pl.add_volume(grid, cmap=cmap, clim=[vmin, vmax], opacity=alpha)
+        _ = pl.add_volume(grid, cmap=cmap, clim=[vmin, vmax], opacity=alpha, scalar_bar_args={'title': ''})
     else:
-        _ = pl.add_volume(grid, cmap=cmap, clim=[vmin, vmax])
+        _ = pl.add_volume(grid, cmap=cmap, clim=[vmin, vmax], scalar_bar_args={'title': ''})
     
     # Set camera position if provided
     if camera_position is not None:

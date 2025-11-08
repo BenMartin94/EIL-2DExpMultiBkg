@@ -444,7 +444,7 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
         overall_mse = np.mean((means_np - targets_np)**2)
         mae = np.mean(np.abs(means_np - targets_np))
         correlation, p_value = error_std_correlation(means_np, stds_np, targets_np)
-        expected_calibration_error_value = wei_ece(means_np, stds_np, targets_np)
+        expected_calibration_error_value, creds, accs = wei_ece(means_np, stds_np, targets_np)
         
         # Save results for later analysis
         results_dict[model_name] = (
@@ -464,7 +464,9 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
             'overall_mse': overall_mse,
             'mae': mae,
             'correlation': correlation,
-            'expected_calibration_error': expected_calibration_error_value
+            'expected_calibration_error': expected_calibration_error_value,
+            'calibration_creds': creds,
+            'calibration_accs': accs
         })
     # Create combined figures: one figure per sample, all models in rows
     num_models = len(models)
@@ -553,6 +555,43 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
         ece = model_result['expected_calibration_error']
         print(f"{model_name:<30} {mse:<15.6e} {mae:<15.6e} {corr:<10.4f} {ece:<10.4f}")
     print(f"{'='*70}\n")
+    
+    # Create combined calibration plot for all models
+    print(f"\n  Creating combined WEI-ECE calibration plot...")
+    plt.figure(figsize=(10, 8))
+    for model_result in all_model_results:
+        model_name = model_result['name']
+        creds = model_result['calibration_creds']
+        accs = model_result['calibration_accs']
+        ece = model_result['expected_calibration_error']
+        
+        # Sort by credibility for proper visualization
+        # Filter out bins with zero credibility (empty bins)
+        mask = creds > 0
+        creds_filtered = creds[mask]
+        accs_filtered = accs[mask]
+        
+        # Sort by credibility
+        sort_idx = np.argsort(creds_filtered)
+        creds_sorted = creds_filtered[sort_idx]
+        accs_sorted = accs_filtered[sort_idx]
+        
+        plt.plot(creds_sorted, accs_sorted, 'o-', linewidth=2, markersize=6, 
+                label=f"{model_name} (ECE={ece:.4f})")
+    
+    plt.plot([0, 1], [0, 1], 'k--', linewidth=2, label='Perfect calibration')
+    plt.xlabel('Credibility (Expected)', fontsize=13)
+    plt.ylabel('Accuracy (Observed)', fontsize=13)
+    plt.title(f'Calibration Curves - {experiment_name}', fontsize=14)
+    plt.legend(fontsize=11)
+    plt.grid(alpha=0.3)
+    plt.xlim([0, 1])
+    plt.ylim([0, 1])
+    plt.tight_layout()
+    calibration_plot_path = os.path.join(exp_output_dir, 'wei_ece_calibration_combined.png')
+    plt.savefig(calibration_plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved calibration plot to: {calibration_plot_path}")
     
     print(f"\n✓ Experiment complete: {experiment_name}")
     print(f"  Figures saved to: {exp_output_dir}")
