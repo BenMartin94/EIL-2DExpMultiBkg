@@ -102,6 +102,10 @@ class Lit3D(pl.LightningModule):
                 dz, hy, wx = D // 2, H // 2, W // 2
 
                 # Build 3x4 grid: rows = Axial/Coronal/Sagittal, cols = GT, Pred mean, Std dev, Abs diff
+                # Font size configuration
+                TITLE_FONTSIZE = 14  # Change this to adjust column titles
+                YLABEL_FONTSIZE = 14  # Change this to adjust slice labels
+                
                 fig, axes = plt.subplots(3, 4, figsize=(16, 12))
 
                 slice_data = [
@@ -109,29 +113,38 @@ class Lit3D(pl.LightningModule):
                     ("Coronal (Y)",  gt[:, hy, :],    pred[:, hy, :],   sd[:, hy, :],    absdiff[:, hy, :]),
                     ("Sagittal (X)", gt[:, :, wx],    pred[:, :, wx],   sd[:, :, wx],    absdiff[:, :, wx]),
                 ]
+                
+                # Column titles (only on top row)
+                column_titles = ["Ground Truth", "Prediction", "Standard Deviation", "|Ground Truth - Prediction|"]
 
-                for r, (title, gt2d, pr2d, sd2d, ad2d) in enumerate(slice_data):
+                for r, (slice_label, gt2d, pr2d, sd2d, ad2d) in enumerate(slice_data):
                     # Shared color limits for GT and prediction per slice
                     vmin = min(gt2d.min(), pr2d.min())
                     vmax = max(gt2d.max(), pr2d.max())
 
                     im0 = axes[r, 0].imshow(gt2d, cmap='viridis', vmin=vmin, vmax=vmax)
-                    axes[r, 0].set_title(f"{title} - GT")
-                    axes[r, 0].axis('off')
+                    if r == 0:  # Only add title to top row
+                        axes[r, 0].set_title(column_titles[0], fontsize=TITLE_FONTSIZE)
+                    axes[r, 0].set_ylabel(slice_label, fontsize=YLABEL_FONTSIZE, rotation=90, labelpad=10)
+                    axes[r, 0].set_xticks([])
+                    axes[r, 0].set_yticks([])
                     fig.colorbar(im0, ax=axes[r, 0], fraction=0.046, pad=0.04)
 
                     im1 = axes[r, 1].imshow(pr2d, cmap='viridis', vmin=vmin, vmax=vmax)
-                    axes[r, 1].set_title(f"{title} - Pred mean")
+                    if r == 0:  # Only add title to top row
+                        axes[r, 1].set_title(column_titles[1], fontsize=TITLE_FONTSIZE)
                     axes[r, 1].axis('off')
                     fig.colorbar(im1, ax=axes[r, 1], fraction=0.046, pad=0.04)
 
                     im2 = axes[r, 2].imshow(sd2d, cmap='plasma')
-                    axes[r, 2].set_title(f"{title} - Std dev")
+                    if r == 0:  # Only add title to top row
+                        axes[r, 2].set_title(column_titles[2], fontsize=TITLE_FONTSIZE)
                     axes[r, 2].axis('off')
                     fig.colorbar(im2, ax=axes[r, 2], fraction=0.046, pad=0.04)
 
                     im3 = axes[r, 3].imshow(ad2d, cmap='magma')
-                    axes[r, 3].set_title(f"{title} - Abs diff")
+                    if r == 0:  # Only add title to top row
+                        axes[r, 3].set_title(column_titles[3], fontsize=TITLE_FONTSIZE)
                     axes[r, 3].axis('off')
                     fig.colorbar(im3, ax=axes[r, 3], fraction=0.046, pad=0.04)
 
@@ -275,7 +288,7 @@ def build_3d_loaders(
     return train_loader, val_loader
 
 
-def save_orthogonal_slices(target_vol: np.ndarray, pred_vol: np.ndarray, std_vol: np.ndarray, output_path: str):
+def save_slices(target_vol: np.ndarray, pred_vol: np.ndarray, std_vol: np.ndarray, output_path: str):
     """
     Saves a 3x4 grid showing 3 slices along the last axis (W/X).
     Rows: 3 different slice positions along the last axis
@@ -295,9 +308,17 @@ def save_orthogonal_slices(target_vol: np.ndarray, pred_vol: np.ndarray, std_vol
     # Select 3 slice indices along the last axis (W): 1/4, 1/2, 3/4
     slice_indices = [w // 4, w // 2, 3 * w // 4]
 
+    # Font size configuration
+    TITLE_FONTSIZE = 20  # Change this to adjust column titles
+    YLABEL_FONTSIZE = 20  # Change this to adjust slice labels
+    SUPTITLE_FONTSIZE = 28  # Change this to adjust the main figure title
+    
     # Create a figure
     fig, axs = plt.subplots(3, 4, figsize=(16, 12), facecolor='w')
-    fig.suptitle('Slices Along Last Axis (X) of 3D Validation Sample', fontsize=15)
+    fig.suptitle('3D Reconstruction - Slices', fontsize=SUPTITLE_FONTSIZE)
+    
+    # Column titles (only on top row)
+    column_titles = ["Ground Truth", "Prediction", "Standard Deviation", "|Ground Truth - Prediction|"]
 
     # Plot the data
     for i, w_idx in enumerate(slice_indices):
@@ -312,26 +333,32 @@ def save_orthogonal_slices(target_vol: np.ndarray, pred_vol: np.ndarray, std_vol
         vmax = max(t_slice.max(), p_slice.max())
 
         im0 = axs[i, 0].imshow(t_slice, cmap='viridis', vmin=vmin, vmax=vmax)
-        axs[i, 0].set_title(f"Slice {w_idx}/{w} - GT")
-        axs[i, 0].axis('off')
+        if i == 0:  # Only add title to top row
+            axs[i, 0].set_title(column_titles[0], fontsize=TITLE_FONTSIZE)
+        axs[i, 0].set_ylabel(f"Slice {w_idx}/{w}", fontsize=YLABEL_FONTSIZE, rotation=90, labelpad=10)
+        axs[i, 0].set_xticks([])
+        axs[i, 0].set_yticks([])
         fig.colorbar(im0, ax=axs[i, 0], fraction=0.046, pad=0.04)
 
         im1 = axs[i, 1].imshow(p_slice, cmap='viridis', vmin=vmin, vmax=vmax)
-        axs[i, 1].set_title(f"Slice {w_idx}/{w} - Pred")
+        if i == 0:  # Only add title to top row
+            axs[i, 1].set_title(column_titles[1], fontsize=TITLE_FONTSIZE)
         axs[i, 1].axis('off')
         fig.colorbar(im1, ax=axs[i, 1], fraction=0.046, pad=0.04)
 
         im_s = axs[i, 2].imshow(s_slice, cmap='plasma')
-        axs[i, 2].set_title(f"Slice {w_idx}/{w} - Std")
+        if i == 0:  # Only add title to top row
+            axs[i, 2].set_title(column_titles[2], fontsize=TITLE_FONTSIZE)
         axs[i, 2].axis('off')
         fig.colorbar(im_s, ax=axs[i, 2], fraction=0.046, pad=0.04)
 
         im = axs[i, 3].imshow(d_slice, cmap='magma')
-        axs[i, 3].set_title(f"Slice {w_idx}/{w} - Error")
+        if i == 0:  # Only add title to top row
+            axs[i, 3].set_title(column_titles[3], fontsize=TITLE_FONTSIZE)
         axs[i, 3].axis('off')
         fig.colorbar(im, ax=axs[i, 3], fraction=0.046, pad=0.04)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
     print(f"\n--- Slice plot saved to: {output_path} ---")
@@ -452,16 +479,18 @@ def main():
             print("[WARN] No best checkpoint path recorded.")
     else:
         # Test-only: load from provided path or find latest
+        device = "cpu"#torch.device("cuda" if torch.cuda.is_available() else "cpu")        
         ckpt_path = args.ckpt_path
         if ckpt_path is None:
             print("No checkpoint path provided, finding the latest...")
             ckpt_path = find_latest_ckpt(EXPERIMENT_TAG)
         print(f"Loading model from checkpoint: {ckpt_path}")
-        checkpoint = torch.load(ckpt_path, map_location='cpu')
+        checkpoint = torch.load(ckpt_path, map_location=device)
         bkgs_from_ckpt = checkpoint['state_dict']['bkgs']
         bkg_fields_from_ckpt = checkpoint['state_dict']['bkg_sct_fields']
         model = Lit3D.load_from_checkpoint(
             ckpt_path,
+            map_location=device,
             strict=False,
             bkgs=bkgs_from_ckpt,
             bkg_sct_fields=bkg_fields_from_ckpt,
@@ -476,7 +505,6 @@ def main():
 
         # Ensure model is on the correct device and in eval mode
         model.eval()
-        device = model.device if hasattr(model, "device") else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         model.to(device)
 
         # Run prediction
@@ -499,7 +527,7 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
         output_path = os.path.join(out_dir, "validation_slices.pdf")
 
-        save_orthogonal_slices(y_true, y_pred, y_std, output_path)
+        save_slices(y_true, y_pred, y_std, output_path)
         
         # --- Render 3D volumes using vedo ---
         print("\n--- Rendering 3D volumes ---")

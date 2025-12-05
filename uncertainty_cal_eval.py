@@ -77,7 +77,22 @@ def wei_ece(mean, std, targets):
         accs (np.ndarray): accuracy values (observed accuracy per bin)
     """
     dirac_delta = 0.05
-    pj = norm.cdf(mean + dirac_delta, loc=mean, scale=std) - norm.cdf(mean - dirac_delta, loc=mean, scale=std)
+
+    mean_shape = mean.shape
+    std_shape = std.shape
+    targets_shape = targets.shape
+
+    if len(mean_shape) != len(targets_shape):
+        # treat first dimension as K rather than batch
+        pj = np.zeros(mean_shape[1:])
+        K = mean_shape[0]
+        for k in range(K):
+            pj += norm.cdf(mean[k] + dirac_delta, loc=mean[k], scale=std[k]) - norm.cdf(mean[k] - dirac_delta, loc=mean[k], scale=std[k])
+        pj /= K  # Average over K MC samples
+    else:
+        pj = norm.cdf(mean + dirac_delta, loc=mean, scale=std) - norm.cdf(mean - dirac_delta, loc=mean, scale=std)
+
+        
     pj_flat = pj.reshape(-1)
     L = 20
     delta_p = 1 / L
@@ -109,8 +124,9 @@ def wei_ece(mean, std, targets):
         else:
             acc = 0
         accs.append(acc)
-    M = len(mean.reshape(-1))
+    M = len(pj_flat)
     ece = 0
+
     for i in range(L):
         ece += (len(Sl_list[i]) / M) * np.abs(creds[i] - accs[i])
     

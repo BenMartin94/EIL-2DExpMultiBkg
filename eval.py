@@ -382,6 +382,8 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
         all_means = []
         all_stds = []
         all_targets = []
+        all_bcnn_preds = []
+        all_bcnn_vars = []
         
         # Run inference on test data
         with torch.no_grad():
@@ -425,6 +427,9 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
                 all_means.append(mean.cpu())
                 all_stds.append(std.cpu())
                 all_targets.append(y.cpu())
+                if model_type == 'bcnn':
+                    all_bcnn_preds.append(predictions.cpu())
+                    all_bcnn_vars.append(variances.cpu())
         
         # Concatenate all batches
         all_inputs = torch.cat(all_inputs, dim=0)
@@ -438,13 +443,24 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
         means_np = all_means.numpy()
         stds_np = all_stds.numpy()
         targets_np = all_targets.numpy()
+        bcnn_preds_np = None
+        bcnn_vars_np = None
+        if model_type == 'bcnn':
+            bcnn_preds_np = torch.cat(all_bcnn_preds, dim=1).numpy()
+            bcnn_vars_np = torch.cat(all_bcnn_vars, dim=1).numpy()
+            bcnn_stds_np = np.sqrt(np.exp(bcnn_vars_np))
+            print(f"  BCNN MC Predictions shape: {bcnn_preds_np.shape}")
         
         # Compute statistics for this model (for summary at end)
         mse_per_sample = np.mean((means_np - targets_np)**2, axis=(1, 2, 3))
         overall_mse = np.mean((means_np - targets_np)**2)
         mae = np.mean(np.abs(means_np - targets_np))
         correlation, p_value = error_std_correlation(means_np, stds_np, targets_np)
-        expected_calibration_error_value, creds, accs = wei_ece(means_np, stds_np, targets_np)
+        if model_type == 'bcnn':
+            expected_calibration_error_value, creds, accs = wei_ece(bcnn_preds_np, bcnn_stds_np, targets_np)
+
+        else:
+            expected_calibration_error_value, creds, accs = wei_ece(means_np, stds_np, targets_np)
         
         # Save results for later analysis
         results_dict[model_name] = (
@@ -558,12 +574,23 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
     
     # Create combined calibration plot for all models
     print(f"\n  Creating combined WEI-ECE calibration plot...")
+    
+    # Font settings
+    TITLE_FONTSIZE = 28
+    AXIS_LABEL_FONTSIZE = 20
+    LEGEND_FONTSIZE = 20
+    TICK_FONTSIZE = 18
+    
     plt.figure(figsize=(10, 8))
-    for model_result in all_model_results:
+    for model_result, model_type in zip(all_model_results, model_types):
         model_name = model_result['name']
         creds = model_result['calibration_creds']
         accs = model_result['calibration_accs']
         ece = model_result['expected_calibration_error']
+        
+        # Map model type to display label
+        label_map = {'mbkg': 'MBM', 'evidential': 'EDLS', 'bcnn': 'BCNN'}
+        display_label = label_map.get(model_type, model_name)
         
         # Sort by credibility for proper visualization
         # Filter out bins with zero credibility (empty bins)
@@ -577,13 +604,14 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
         accs_sorted = accs_filtered[sort_idx]
         
         plt.plot(creds_sorted, accs_sorted, 'o-', linewidth=2, markersize=6, 
-                label=f"{model_name} (ECE={ece:.4f})")
+                label=f"{display_label} (ECE={ece:.4f})")
     
     plt.plot([0, 1], [0, 1], 'k--', linewidth=2, label='Perfect calibration')
-    plt.xlabel('Credibility (Expected)', fontsize=13)
-    plt.ylabel('Accuracy (Observed)', fontsize=13)
-    plt.title(f'Calibration Curves - {experiment_name}', fontsize=14)
-    plt.legend(fontsize=11)
+    plt.xlabel('Credibility (Expected)', fontsize=AXIS_LABEL_FONTSIZE)
+    plt.ylabel('Accuracy (Observed)', fontsize=AXIS_LABEL_FONTSIZE)
+    plt.title(f'Calibration Curves - {experiment_name}', fontsize=TITLE_FONTSIZE)
+    plt.legend(fontsize=LEGEND_FONTSIZE)
+    plt.tick_params(axis='both', which='major', labelsize=TICK_FONTSIZE)
     plt.grid(alpha=0.3)
     plt.xlim([0, 1])
     plt.ylim([0, 1])
@@ -717,7 +745,7 @@ def main():
     results_dict = run_experiment(
         models, model_types, EXPERIMENT_NAMES,
         synth_test_loader,
-        experiment_name="Experiment 4.5 - 100% Noise",
+        experiment_name="Experiment 5 - 100% Noise",
         output_dir="figures",
         max_figures=10,
         device=DEVICE,
@@ -730,7 +758,7 @@ def main():
     results_dict = run_experiment(
         models, model_types, EXPERIMENT_NAMES,
         cal_loader,
-        experiment_name="Experiment 5 - Calibrated E-field Test Set",
+        experiment_name="Experiment 6 - Calibrated E-field Test Set",
         output_dir="figures",
         max_figures=10,
         device=DEVICE,
@@ -742,7 +770,7 @@ def main():
     results_dict = run_experiment(
         models, model_types, EXPERIMENT_NAMES,
         cal_loader,
-        experiment_name="Experiment 5 - Calibrated E-field Test Set with 100% Noise",
+        experiment_name="Experiment 7 - Calibrated E-field Test Set with 100% Noise",
         output_dir="figures",
         max_figures=10,
         device=DEVICE,

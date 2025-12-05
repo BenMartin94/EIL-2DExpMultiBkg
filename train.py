@@ -601,6 +601,7 @@ def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers:
     )
 
     # cal_e_fields and uncal_spars are only used for testing so there is no need to use their *test* versions, those were only created for clarity and symmetry.
+    print(f"length of synth dataset: {len(synth_fields)}")
 
     synth_dataset = MultiBkgDataset(fields=synth_fields, grids=grids, n_backgrounds=num_backgrounds)
     synth_test_dataset = FieldsDataset(x_np=synth_fields_test, y_np=grids_test)
@@ -931,7 +932,7 @@ def main():
     parser.add_argument("--debug-recon", action="store_true", help="Run a single debug reconstruction before training")
     parser.add_argument("--test-only", action="store_true", help="Skip training and run test on a checkpoint.")
     parser.add_argument("--ckpt-path", type=str, default=None, help="Path to checkpoint for testing. If None, finds latest.")
-    parser.add_argument("--experiment-tag", type=str, default="mbg_train_synth_test_cal_exp_25bkgs_1fg", help="Tag for experiment (used in logging)")
+    parser.add_argument("--experiment-tag", type=str, default="mbg_train_synth_test_cal_exp_25bkgs_testing_bkg_numbers", help="Tag for experiment (used in logging)")
     parser.add_argument("--num-backgrounds", type=int, default=25, help="Number of backgrounds to use from training dataset")
     parser.add_argument("--steps-per-epoch", type=int, default=None, help="Number of training steps per epoch. If None, uses full dataset. Data will be reused if this exceeds dataset size.")
 
