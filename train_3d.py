@@ -16,6 +16,7 @@ from MultiBkgDataset_3d import Fields3DMultiBkgDataset
 
 from Models_3d import TransformerUNet
 from rendering import render_volume
+import matplotlib.pyplot as plt
 
 
 # --- Minimal LightningModule for 3D training ---
@@ -32,9 +33,13 @@ class Lit3D(pl.LightningModule):
         dropout_rate: float = 0.0,
         bkgs: torch.Tensor | None = None,            # (n_bgs,1,D,H,W)
         bkg_sct_fields: torch.Tensor | None = None,  # (n_bgs,2F,R,S)
+        mbg_dataset = None,                          # MultiBkgDataset for sanity checks
+        train_loader = None,                         # Train data loader for sanity checks
+        val_loader = None,                           # Val data loader for sanity checks
+        test_loader = None,                          # Test data loader for evaluation
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=['bkgs', 'bkg_sct_fields'])
+        self.save_hyperparameters(ignore=['bkgs', 'bkg_sct_fields', 'mbg_dataset', 'train_loader', 'val_loader', 'test_loader'])
         self.model = TransformerUNet(
             num_transformer_layers=num_transformer_layers,
             num_heads=num_heads,
@@ -47,13 +52,17 @@ class Lit3D(pl.LightningModule):
         # store backgrounds as buffers
         self.register_buffer('bkgs', bkgs)
         self.register_buffer('bkg_sct_fields', bkg_sct_fields)
+        self.mbg_dataset = mbg_dataset
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
     # Validation plotting strategy: plot only on first val batch per epoch
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 2F, R, S) = (B, 2, 72, 72)
-        # TransformerUNet expects (B, C, H*W) where C=2*num_freqs, H*W=R*S
-        B, C, H, W = x.shape
-        x_flat = x.view(B, C, H * W)  # (B, 2, 5184)
+        # x: (B, 2, S, R) = (B, 2, 72, 72) where 2=[real, imag], S=sources, R=receivers
+        # TransformerUNet expects (B, C, H*W) where C=2, H*W=S*R=5184
+        B, C, S, R = x.shape
+        x_flat = x.view(B, C, S * R)  # (B, 2, 5184)
         return self.model(x_flat)  # (B, D, H, W) with D=H=W=image_dim
 
     def training_step(self, batch, batch_idx: int):
@@ -61,6 +70,47 @@ class Lit3D(pl.LightningModule):
         y_hat = self(x).unsqueeze(1)  # (B,1,D,H,W)
         loss = self.criterion(y_hat, y)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        
+        # Plot once per epoch on the first batch - matching test plot format
+        if batch_idx == 0:
+            import matplotlib.pyplot as plt
+            fig_dir = f"figures/3d/epoch_{self.current_epoch}"
+            os.makedirs(fig_dir, exist_ok=True)
+            
+            # Plot first example in batch
+            i = 0
+            pred_contrast = y_hat[i, 0].detach().cpu().numpy()  # (D, H, W)
+            bg = bg_vol[i, 0].detach().cpu().numpy()  # (D, H, W)
+            true_contrast = y[i, 0].detach().cpu().numpy()  # (D, H, W)
+            
+            D, H, W = pred_contrast.shape
+            dz = D // 2
+            
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            
+            vmin = min(pred_contrast[:, :, dz].min(), bg[:, :, dz].min(), true_contrast[:, :, dz].min())
+            vmax = max(pred_contrast[:, :, dz].max(), bg[:, :, dz].max(), true_contrast[:, :, dz].max())
+            
+            im0 = axes[0].imshow(bg[:, :, dz], cmap='viridis', vmin=vmin, vmax=vmax)
+            axes[0].set_title('Background Volume Slice', fontsize=14)
+            axes[0].axis('off')
+            fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+            
+            im1 = axes[1].imshow(pred_contrast[:, :, dz], cmap='viridis', vmin=vmin, vmax=vmax)
+            axes[1].set_title('Predicted Contrast Slice', fontsize=14)
+            axes[1].axis('off')
+            fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+            
+            im2 = axes[2].imshow(true_contrast[:, :, dz], cmap='viridis', vmin=vmin, vmax=vmax)
+            axes[2].set_title('True Contrast Slice', fontsize=14)
+            axes[2].axis('off')
+            fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+            
+            plt.tight_layout()
+            fig_path = os.path.join(fig_dir, "train_contrast_example.pdf")
+            plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+        
         return loss
 
     # Plotting controlled by batch_idx == 0; no counters needed
@@ -149,86 +199,143 @@ class Lit3D(pl.LightningModule):
                     fig.colorbar(im3, ax=axes[r, 3], fraction=0.046, pad=0.04)
 
                 plt.tight_layout()
-                fig_dir = f"figures/epoch_{self.current_epoch}"
+                fig_dir = f"figures/3d/epoch_{self.current_epoch}"
                 os.makedirs(fig_dir, exist_ok=True)
                 fig_path = os.path.join(fig_dir, f"val_step_{batch_idx}_slices.pdf")
                 plt.savefig(fig_path, dpi=150)
                 plt.close(fig)
                 
-                # --- Render 3D volumes using vedo ---
-                try:
-                    # Render ground truth
-                    render_volume(
-                        volume=gt,
-                        output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_gt_render.png"),
-                        focal_point=(D//2, H//2, W//2),
-                        image_size=(800, 800),
-                        colormap="turbo",
-                        alpha=[0, 0.1, 0.3, 0.6, 1.0],
-                        show_axes=True,
-                        background="white",
-                    )
-                    
-                    # Render prediction
-                    render_volume(
-                        volume=pred,
-                        output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_pred_render.png"),
-                        focal_point=(D//2, H//2, W//2),
-                        image_size=(800, 800),
-                        colormap="turbo",
-                        alpha=[0, 0.1, 0.3, 0.6, 1.0],
-                        threshold=1.1,
-                        show_axes=True,
-                        background="white",
-                        vmin=1.0,
-                    )
-                    
-                    # Render uncertainty (std)
-                    render_volume(
-                        volume=sd,
-                        output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_std_render.png"),
-                        focal_point=(D//2, H//2, W//2),
-                        image_size=(800, 800),
-                        colormap="plasma",
-                        alpha=[0, 0.2, 0.4, 0.7, 1.0],
-                        show_axes=True,
-                        background="white"
-                    )
-                    
-                    # Render absolute difference
-                    render_volume(
-                        volume=absdiff,
-                        output_path=os.path.join(fig_dir, f"val_step_{batch_idx}_diff_render.png"),
-                        focal_point=(D//2, H//2, W//2),
-                        image_size=(800, 800),
-                        colormap="magma",
-                        alpha=[0, 0.2, 0.4, 0.7, 1.0],
-                        show_axes=True,
-                        background="white"
-                    )
-                except Exception as e:
-                    print(f"[WARN] Volume rendering failed: {e}")
-                    # No counters; plotted only for batch_idx==0
+                # Evaluate on test set once per epoch (at batch_idx == 0)
+                if self.test_loader is not None:
+                    self._evaluate_test_set(fig_dir)
             
         return val_loss
+
+    def _evaluate_test_set(self, fig_dir: str):
+        """Evaluate on test set and create comparison plot"""
+        test_losses = []
+        first_batch_data = None
+        
+        for batch_idx, (x_test, y_test) in enumerate(self.test_loader):
+            x_test = x_test.to(self.device)
+            y_test = y_test.to(self.device)
+            B = x_test.shape[0]
+            
+            # Expand backgrounds for all B samples
+            bg_sct = self.bkg_sct_fields.unsqueeze(0).expand(B, -1, -1, -1, -1)
+            bg_vol = self.bkgs.unsqueeze(0).expand(B, -1, -1, -1, -1, -1)
+            
+            # Perform full reconstruction using all backgrounds
+            per_bkg_recon, mean_recon, std_recon = self.reconstruction(x_test, bg_sct, bg_vol)
+
+            # example contrast
+            sct1 = x_test[0:1] - self.bkg_sct_fields[0:1]
+            contrast1 = (y_test[0:1] - self.bkgs[0:1]) / self.bkgs[0:1]
+
+            # dataset_field = self.mbg_dataset[0][0].to(self.device)
+            # dataset_contrast = self.mbg_dataset[0][1].to(self.device)
+
+            # assert torch.allclose(sct1, dataset_field, atol=1e-6), "Sanity check failed: scattered field does not match dataset"
+            # assert torch.allclose(contrast1, dataset_contrast, atol=1e-6), "Sanity check failed: contrast volume does not match dataset"
+
+            pred_contrast1 = self(sct1)
+            pred_perm = pred_contrast1 * self.bkgs[0:1] + self.bkgs[0:1]
+
+            # assert torch.allclose(pred_perm, per_bkg_recon[0:1, 0], atol=1e-6), "Sanity check failed: per-background reconstruction does not match model output"
+            
+            # Save first batch for plotting
+            if batch_idx == 0:
+                first_batch_data = (per_bkg_recon, mean_recon, y_test)
+                # plot the pred contrast example along with bkg, and true contrast
+                import matplotlib.pyplot as plt
+                pc1 = pred_contrast1[0, :, :, :].detach().cpu().numpy()
+                bc1 = self.bkgs[0, 0, :, :, :].detach().cpu().numpy()
+                tc1 = contrast1[0, 0, :, :, :].detach().cpu().numpy()
+                D, H, W = pc1.shape
+                dz = D // 2
+                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                vmin = min(pc1[:, :, dz].min(), bc1[:, :, dz].min(), tc1[:, :, dz].min())
+                vmax = max(pc1[:, :, dz].max(), bc1[:, :, dz].max(), tc1[:, :, dz].max())
+                im0 = axes[0].imshow(bc1[:, :, dz], cmap='viridis', vmin=vmin, vmax=vmax)
+                axes[0].set_title('Background Volume Slice', fontsize=14)
+                axes[0].axis('off')
+                fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+                im1 = axes[1].imshow(pc1[:, :, dz], cmap='viridis', vmin=vmin, vmax=vmax)
+                axes[1].set_title('Predicted Contrast Slice', fontsize=14)
+                axes[1].axis('off')
+                fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+                im2 = axes[2].imshow(tc1[:, :, dz], cmap='viridis', vmin=vmin, vmax=vmax)
+                axes[2].set_title('True Contrast Slice', fontsize=14)
+                axes[2].axis('off')
+                fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+                plt.tight_layout()
+                fig_path = os.path.join(fig_dir, "test_contrast_example.pdf")
+                plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+                plt.close(fig)
+
+            
+            # Compute loss
+            test_loss = torch.nn.functional.mse_loss(pred_perm, y_test[0:1])
+            
+            test_losses.append(test_loss.item())
+        
+        # Log test metrics
+        avg_test_loss = np.mean(test_losses)
+        self.log("test_loss", avg_test_loss, on_step=False, on_epoch=True, prog_bar=True)
+        
+        # Create comparison plot
+        if first_batch_data is not None:
+            per_bkg_recon, mean_recon, y_test = first_batch_data
+            
+            first_per_bkg = per_bkg_recon[0, 0, 0].detach().cpu().numpy()
+            mean_pred = mean_recon[0, 0].detach().cpu().numpy()
+            gt = y_test[0, 0].detach().cpu().numpy()
+            
+            D, H, W = gt.shape
+            dz = D // 2
+            
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            
+            vmin = min(first_per_bkg[:, :, dz].min(), mean_pred[:, :, dz].min(), gt[:, :, dz].min())
+            vmax = max(first_per_bkg[:, :, dz].max(), mean_pred[:, :, dz].max(), gt[:, :, dz].max())
+            
+            im0 = axes[0].imshow(first_per_bkg[:, :, dz], cmap='viridis', vmin=vmin, vmax=vmax)
+            axes[0].set_title('First Per-Background Recon', fontsize=14)
+            axes[0].axis('off')
+            fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+            
+            im1 = axes[1].imshow(mean_pred[:, :, dz], cmap='viridis', vmin=vmin, vmax=vmax)
+            axes[1].set_title('Mean Reconstruction', fontsize=14)
+            axes[1].axis('off')
+            fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+            
+            im2 = axes[2].imshow(gt[:, :, dz], cmap='viridis', vmin=vmin, vmax=vmax)
+            axes[2].set_title('Ground Truth', fontsize=14)
+            axes[2].axis('off')
+            fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+            
+            plt.tight_layout()
+            fig_path = os.path.join(fig_dir, "test_comparison.pdf")
+            plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
 
     def reconstruction(self, fg_sct: torch.Tensor, bg_sct: torch.Tensor, bg_vol: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Reconstruct foreground volume using all backgrounds:
-          fg_sct: (B,2F,R,S)
-          bg_sct: (B,nbgs,2F,R,S)
-          bg_vol: (B,nbgs,1,D,H,W)
+          fg_sct: (B, 2, S, R)
+          bg_sct: (B, nbgs, 2, S, R)
+          bg_vol: (B, nbgs, 1, D, H, W)
         Returns: (per_bkg, mean, std) with shapes
-          per_bkg: (B,nbgs,1,D,H,W)
-          mean/std: (B,1,D,H,W)
+          per_bkg: (B, nbgs, 1, D, H, W)
+          mean/std: (B, 1, D, H, W)
         """
-        B, nbgs, _, R, S = bg_sct.shape
-        C = fg_sct.shape[1]
+        B, nbgs, _, S, R = bg_sct.shape
+        C = fg_sct.shape[1]  # C = 2
         D = bg_vol.shape[-3]
 
-        fg_exp = fg_sct.unsqueeze(1).expand(-1, nbgs, -1, -1, -1)
-        contrast_in = fg_exp - bg_sct  # (B,nbgs,2F,R,S)
-        contrast_in = contrast_in.reshape(B * nbgs, C, R, S)
+        fg_exp = fg_sct.unsqueeze(1).expand(-1, nbgs, -1, -1, -1)  # (B, nbgs, 2, S, R)
+        contrast_in = fg_exp - bg_sct  # (B, nbgs, 2, S, R)
+        contrast_in = contrast_in.reshape(B * nbgs, C, S, R)  # (B*nbgs, 2, S, R)
         pred_contrast = self(contrast_in).unsqueeze(1)  # (B*nbgs,1,D,H,W)
         pred_contrast = pred_contrast.view(B, nbgs, 1, D, D, D)  # cubic
 
@@ -250,18 +357,20 @@ def build_3d_loaders(
     num_workers: int,
     seed: int,
     n_backgrounds: int,
+    num_test: int = 10,
+    max_samples: int = None,
 ):
 
-    # Get training arrays (trainset=True normalizes with train stats and saves mean/std)
-    train_pkg = prep.process_multifreq_data(
+    # Get training and test arrays in one call
+    train_pkg, test_pkg = prep.process_multifreq_data(
         fields_file=fields_file,
         targets_file=targets_file,
         targetless_fields_file=targetless_fields_file,
-        num_test=0,
-        trainset=True,
+        num_test=num_test,
+        max_samples=max_samples,
     )
 
-    # MultiBkg pairing dataset
+    # MultiBkg pairing dataset for training
     ds_full = Fields3DMultiBkgDataset(
         fields_np=train_pkg.fields,
         targets_np=train_pkg.targets,
@@ -270,6 +379,12 @@ def build_3d_loaders(
         seed=seed,
     )
 
+    
+    from torch.utils.data import TensorDataset
+    test_fields_tensor = torch.tensor(test_pkg.fields, dtype=torch.float32)  # (N, 2, S, R)
+    test_targets_tensor = torch.tensor(test_pkg.targets, dtype=torch.float32).unsqueeze(1)  # (N, 1, D, H, W)
+    test_ds = TensorDataset(test_fields_tensor, test_targets_tensor)
+
     # Train/Val split on the paired dataset
     n_total = len(ds_full)
     n_val = max(1, int(n_total * val_split))
@@ -277,18 +392,22 @@ def build_3d_loaders(
     g = torch.Generator().manual_seed(seed)
     train_ds, val_ds = random_split(ds_full, [n_train, n_val], generator=g)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
     # Summary
     x0, y0, *_ = ds_full[0]
     print("3D MultiBkg Data summary:")
-    print(f"  Input x shape: {tuple(x0.shape)}  # (2F, R, S)")
+    print(f"  Train samples: {len(train_ds)}")
+    print(f"  Val samples: {len(val_ds)}")
+    print(f"  Test samples: {len(test_ds)}")
+    print(f"  Input x shape: {tuple(x0.shape)}  # (2, S, R) where 2=[real,imag]")
     print(f"  Target y shape: {tuple(y0.shape)}  # (1, D, H, W)")
-    return train_loader, val_loader
+    return train_loader, val_loader, test_loader
 
 
-def save_slices(target_vol: np.ndarray, pred_vol: np.ndarray, std_vol: np.ndarray, output_path: str):
+def save_orthogonal_slices(target_vol: np.ndarray, pred_vol: np.ndarray, std_vol: np.ndarray, output_path: str):
     """
     Saves a 3x4 grid showing 3 slices along the last axis (W/X).
     Rows: 3 different slice positions along the last axis
@@ -308,17 +427,9 @@ def save_slices(target_vol: np.ndarray, pred_vol: np.ndarray, std_vol: np.ndarra
     # Select 3 slice indices along the last axis (W): 1/4, 1/2, 3/4
     slice_indices = [w // 4, w // 2, 3 * w // 4]
 
-    # Font size configuration
-    TITLE_FONTSIZE = 20  # Change this to adjust column titles
-    YLABEL_FONTSIZE = 20  # Change this to adjust slice labels
-    SUPTITLE_FONTSIZE = 28  # Change this to adjust the main figure title
-    
     # Create a figure
     fig, axs = plt.subplots(3, 4, figsize=(16, 12), facecolor='w')
-    fig.suptitle('3D Reconstruction - Slices', fontsize=SUPTITLE_FONTSIZE)
-    
-    # Column titles (only on top row)
-    column_titles = ["Ground Truth", "Prediction", "Standard Deviation", "|Ground Truth - Prediction|"]
+    fig.suptitle('Slices Along Last Axis (X) of 3D Validation Sample', fontsize=15)
 
     # Plot the data
     for i, w_idx in enumerate(slice_indices):
@@ -333,32 +444,26 @@ def save_slices(target_vol: np.ndarray, pred_vol: np.ndarray, std_vol: np.ndarra
         vmax = max(t_slice.max(), p_slice.max())
 
         im0 = axs[i, 0].imshow(t_slice, cmap='viridis', vmin=vmin, vmax=vmax)
-        if i == 0:  # Only add title to top row
-            axs[i, 0].set_title(column_titles[0], fontsize=TITLE_FONTSIZE)
-        axs[i, 0].set_ylabel(f"Slice {w_idx}/{w}", fontsize=YLABEL_FONTSIZE, rotation=90, labelpad=10)
-        axs[i, 0].set_xticks([])
-        axs[i, 0].set_yticks([])
+        axs[i, 0].set_title(f"Slice {w_idx}/{w} - GT")
+        axs[i, 0].axis('off')
         fig.colorbar(im0, ax=axs[i, 0], fraction=0.046, pad=0.04)
 
         im1 = axs[i, 1].imshow(p_slice, cmap='viridis', vmin=vmin, vmax=vmax)
-        if i == 0:  # Only add title to top row
-            axs[i, 1].set_title(column_titles[1], fontsize=TITLE_FONTSIZE)
+        axs[i, 1].set_title(f"Slice {w_idx}/{w} - Pred")
         axs[i, 1].axis('off')
         fig.colorbar(im1, ax=axs[i, 1], fraction=0.046, pad=0.04)
 
         im_s = axs[i, 2].imshow(s_slice, cmap='plasma')
-        if i == 0:  # Only add title to top row
-            axs[i, 2].set_title(column_titles[2], fontsize=TITLE_FONTSIZE)
+        axs[i, 2].set_title(f"Slice {w_idx}/{w} - Std")
         axs[i, 2].axis('off')
         fig.colorbar(im_s, ax=axs[i, 2], fraction=0.046, pad=0.04)
 
         im = axs[i, 3].imshow(d_slice, cmap='magma')
-        if i == 0:  # Only add title to top row
-            axs[i, 3].set_title(column_titles[3], fontsize=TITLE_FONTSIZE)
+        axs[i, 3].set_title(f"Slice {w_idx}/{w} - Error")
         axs[i, 3].axis('off')
         fig.colorbar(im, ax=axs[i, 3], fraction=0.046, pad=0.04)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(output_path, dpi=150)
     plt.close()
     print(f"\n--- Slice plot saved to: {output_path} ---")
@@ -369,7 +474,7 @@ def main():
     parser.add_argument("--fields-file", type=str, default="./3d_dataset/field_data_with2000Target_72Rx.mat", help="Path to fields .h5 file")
     parser.add_argument("--targets-file", type=str, default="./3d_dataset/targets_data_with2000Target.mat", help="Path to targets .h5 file")
     parser.add_argument("--targetless-fields-file", type=str, default="./3d_dataset/targetless_fielddata_72Rx.mat", help="Path to targetless fields .h5 file")
-    parser.add_argument("--epochs", type=int, default=35)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--val-split", type=float, default=0.05)
@@ -378,7 +483,8 @@ def main():
     parser.add_argument("--num-transformer-layers", type=int, default=1)
     parser.add_argument("--num-heads", type=int, default=16)
     parser.add_argument("--fast-dev-run", action="store_true")
-    parser.add_argument("--n-backgrounds", type=int, default=25)
+    parser.add_argument("--n-backgrounds", type=int, default=10)
+    parser.add_argument("--max-samples", type=int, default=2000, help="Limit total dataset size before train/test split (useful for testing)")
     parser.add_argument("--test-only", action="store_true", help="Skip training and load the latest/best checkpoint")
     parser.add_argument("--ckpt-path", type=str, default=None, help="Path to checkpoint. If None, finds latest.")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path to checkpoint to resume training from. Restores model, epoch, step, LR schedulers, etc.")
@@ -386,9 +492,9 @@ def main():
     args = parser.parse_args()
 
     # Keep tag aligned with logger name to find checkpoints
-    EXPERIMENT_TAG = "mbg_3d_multibkg"
+    EXPERIMENT_TAG = "mbg_3d_multibkg_10bkgs"
 
-    train_loader, val_loader = build_3d_loaders(
+    train_loader, val_loader, test_loader = build_3d_loaders(
         fields_file=args.fields_file,
         targets_file=args.targets_file,
         targetless_fields_file=args.targetless_fields_file,
@@ -397,6 +503,7 @@ def main():
         num_workers=args.num_workers,
         seed=args.seed,
         n_backgrounds=args.n_backgrounds,
+        max_samples=args.max_samples,
     )
 
     # Infer dimensions and backgrounds from the underlying dataset
@@ -437,6 +544,10 @@ def main():
             dropout_rate=0.0,
             bkgs=bg_vols,
             bkg_sct_fields=bg_fields,
+            mbg_dataset=base_ds,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
         )
 
         trainer = pl.Trainer(
@@ -471,6 +582,9 @@ def main():
                     strict=False,
                     bkgs=bkgs_from_ckpt,
                     bkg_sct_fields=bkg_fields_from_ckpt,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    test_loader=test_loader,
                 )
             except Exception:
                 # Fall back to using the in-memory model if load fails
@@ -479,21 +593,22 @@ def main():
             print("[WARN] No best checkpoint path recorded.")
     else:
         # Test-only: load from provided path or find latest
-        device = "cpu"#torch.device("cuda" if torch.cuda.is_available() else "cpu")        
         ckpt_path = args.ckpt_path
         if ckpt_path is None:
             print("No checkpoint path provided, finding the latest...")
             ckpt_path = find_latest_ckpt(EXPERIMENT_TAG)
         print(f"Loading model from checkpoint: {ckpt_path}")
-        checkpoint = torch.load(ckpt_path, map_location=device)
+        checkpoint = torch.load(ckpt_path, map_location='cpu')
         bkgs_from_ckpt = checkpoint['state_dict']['bkgs']
         bkg_fields_from_ckpt = checkpoint['state_dict']['bkg_sct_fields']
         model = Lit3D.load_from_checkpoint(
             ckpt_path,
-            map_location=device,
             strict=False,
             bkgs=bkgs_from_ckpt,
             bkg_sct_fields=bkg_fields_from_ckpt,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
         )
 
     # --- Save orthogonal slices of one validation example to a PNG file ---
@@ -505,6 +620,7 @@ def main():
 
         # Ensure model is on the correct device and in eval mode
         model.eval()
+        device = model.device if hasattr(model, "device") else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         model.to(device)
 
         # Run prediction
@@ -527,7 +643,7 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
         output_path = os.path.join(out_dir, "validation_slices.pdf")
 
-        save_slices(y_true, y_pred, y_std, output_path)
+        save_orthogonal_slices(y_true, y_pred, y_std, output_path)
         
         # --- Render 3D volumes using vedo ---
         print("\n--- Rendering 3D volumes ---")

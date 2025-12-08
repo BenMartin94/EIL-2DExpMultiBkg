@@ -1,4 +1,5 @@
 import numpy as np
+import os
 import h5py
 import torchvision  # Replaces keras
 from skimage.transform import resize
@@ -77,12 +78,12 @@ def create_3d_mnist_data(target_file):
 
 
 # for multifrequency data generated from julia solver, saved as a .mat file
-#    returns field_data as (num_targets, num_recvers, 2*num_sources, num_freqs), target data as (num_targets, 28, 28)
-def process_multifreq_data(fields_file, targets_file, targetless_fields_file, num_test, trainset=True):
+#    returns train_data and test_data as Dataset objects
+#    Field data format: (N, 2, S, R) where 2 = real and imag channels
+def process_multifreq_data(fields_file, targets_file, targetless_fields_file, num_test, max_samples=None):
     print("Processing data...")
     # load field data
     with h5py.File(fields_file, 'r') as field_data:
-        # print(list(field_data.keys()))
         fields = np.array(field_data['fields'])     # (num_targets, num_freqs, num_sources, num_recvers)  
         freqs = np.array(field_data['freqs'])
         num_freqs = np.size(freqs)
@@ -92,97 +93,91 @@ def process_multifreq_data(fields_file, targets_file, targetless_fields_file, nu
         print("recvers: ", num_recvers)
         print("sources: ", num_sources)
 
-
-    fields = np.transpose(fields, [0, 2, 3, 1]) # freqs last
-
-    # seperate complex number data for field data
-    field_data = np.zeros((num_targets, num_sources, num_recvers, 2*num_freqs))
-    for i in range(0, num_targets):
-        for j in range(0, num_sources):
-            for k in range(0, num_recvers):
-                for l in range(0, num_freqs):
-                    field = fields[i, j, k, l]
-                    field_data[i, j, k, 2*l] = field[0]
-                    field_data[i, j, k, 2*l+1] = field[1]
+    # Convert to single frequency data (2.5GHz) - take frequency index 7 (14:16 are real/imag)
+    # fields is (num_targets, num_freqs, num_sources, num_recvers)
+    # We want (num_targets, 2, num_sources, num_recvers) where 2 = [real, imag]
+    freq_idx = 7  # 2.5GHz
+    
+    # HDF5 stores complex as structured array with 'real' and 'imag' fields
+    fields_real = fields[:, freq_idx, :, :]['real']  # (num_targets, num_sources, num_recvers)
+    fields_imag = fields[:, freq_idx, :, :]['imag']  # (num_targets, num_sources, num_recvers)
+    
+    # Stack real and imag as channels: (num_targets, 2, num_sources, num_recvers)
+    field_data = np.stack([fields_real, fields_imag], axis=1)
+    num_freqs = 1
 
     # load targetless field data
     with h5py.File(targetless_fields_file, 'r') as targetless_field_data:
-        # print(list(field_data.keys()))
-        targetless_fields = np.array(targetless_field_data['fields'])     # (num_targets, num_freqs, num_recvers, num_sources) 
-        targetless_fields = np.transpose(targetless_fields, [0, 2, 3, 1])
-
-    # seperate complex number data for targetless field data
-    targetless_field_data = np.zeros((num_targets, num_sources, num_recvers, 2*num_freqs))
-    for j in range(0, num_sources):
-        for k in range(0, num_recvers):
-            for l in range(0, num_freqs):
-                field = targetless_fields[0, j, k, l]
-                targetless_field_data[0, j, k, 2*l] = field[0]
-                targetless_field_data[0, j, k, 2*l+1] = field[1]
+        targetless_fields = np.array(targetless_field_data['fields'])     # (1, num_freqs, num_sources, num_recvers) 
+    
+    # Extract same frequency for targetless - access structured array fields
+    targetless_real = targetless_fields[0, freq_idx, :, :]['real']  # (num_sources, num_recvers)
+    targetless_imag = targetless_fields[0, freq_idx, :, :]['imag']  # (num_sources, num_recvers)
+    targetless_field_data = np.stack([targetless_real, targetless_imag], axis=0)  # (2, num_sources, num_recvers)
 
     # convert total fields into scattered fields by subtracting fields with no targets
-    for target in range(0, num_targets):
-        field_data[target, :, :, :] = field_data[target, :, :, :] - targetless_field_data[0, :, :, :]
+    # Broadcasting: (num_targets, 2, num_sources, num_recvers) - (2, num_sources, num_recvers)
+    field_data = field_data - targetless_field_data[np.newaxis, :, :, :]
 
-    # convert to single frequency data (1GHz) (take both real and im channels)
-    field_data = field_data[:, :, :, 14:16]
-    num_freqs = 1
-
-    print("Field data shape: ", field_data.shape)  # (num_targets, num_sources, num_recvers, 2*num_freqs)
+    print("Field data shape: ", field_data.shape)  # (num_targets, 2, num_sources, num_recvers)
 
     # num_sources = 24 and recvers = 72. Make it square by duplicating sources 3x
-    field_data = np.concatenate((field_data, field_data, field_data), axis=1)
+    # Concatenate along source axis: (num_targets, 2, num_sources*3, num_recvers)
+    field_data = np.concatenate([field_data, field_data, field_data], axis=2)
     num_sources = num_sources * 3
+
+    print("Final field data shape: ", field_data.shape)  # (num_targets, 2, 72, 72)
 
     # load targets
     ### for providing physical targets (not just target info)
     # with h5py.File(targets_file, 'r') as target_data:
     #     targets = np.array(target_data['targets'])      # (num_targets, 112, 112)
     
-    targets = create_3d_mnist_data(targets_file)
+    # Cache 3D MNIST targets to avoid rebuilding every time
+    cache_path = "./data/3d/cached_3d_mnist_targets.npy"
+    if os.path.exists(cache_path):
+        print("Loading cached 3D MNIST targets...")
+        targets = np.load(cache_path)
+    else:
+        print("Creating 3D MNIST targets (this may take a moment)...")
+        targets = create_3d_mnist_data(targets_file)
+        os.makedirs("./data/3d", exist_ok=True)
+        np.save(cache_path, targets)
+        print(f"Cached 3D MNIST targets saved to {cache_path}")
+
+    # Limit dataset size if max_samples is specified
+    if max_samples is not None and max_samples < num_targets:
+        print(f"Limiting dataset from {num_targets} to {max_samples} samples")
+        field_data = field_data[:max_samples]
+        targets = targets[:max_samples]
+        num_targets = max_samples
 
     # split into training and test sets
-    field_data_train = field_data[num_test:, :, :, :]
+    field_data_train = field_data[num_test:, :, :, :]  # (N_train, 2, S, R)
     targets_train = targets[num_test:, :, :]
-    num_targets = num_targets - num_test
+    num_targets_train = num_targets - num_test
 
-    field_data_test = field_data[0:num_test, :, :, :]
+    field_data_test = field_data[0:num_test, :, :, :]  # (N_test, 2, S, R)
     targets_test = targets[0:num_test, :, :]
 
-    # z-score normalize data (on trainset data only)
-    if (trainset):
-        data_mean = np.mean(field_data_train)
-        data_std = np.std(field_data_train)
-        field_data_train = (field_data_train - data_mean) / (data_std+1e-6)
-        train_data = Dataset(field_data_train, targets_train, num_targets, num_freqs, num_recvers, num_sources)
-
-        return train_data
+    # z-score normalize data pixel-wise across samples only (axis=0)
+    data_mean = np.mean(field_data_train, axis=0, keepdims=True)  # Shape: (1, 2, S, R)
+    data_std = np.std(field_data_train, axis=0, keepdims=True)    # Shape: (1, 2, S, R)
     
-    else: # testset
-        stats = np.load("./Data/3d/2000_mean_std.npy")
-        data_mean = stats[0]
-        data_std = stats[1]
-        field_data_test = (field_data_test - data_mean) / data_std
-        test_data = Dataset(field_data_test, targets_test, num_test, num_freqs, num_recvers, num_sources)
-
-        return test_data
-
-    # normalize to [0,1] (on trainset data only)
-    # if (trainset):
-    #     fields_max = np.max(field_data_train)
-    #     fields_min = np.min(field_data_train)
-    #     field_data_train = (field_data_train - fields_min) / (fields_max - fields_min)
-    #     train_data = Dataset(field_data_train, targets_train, num_targets, num_freqs, num_recvers, num_sources)
-
-    #     np.save("./Data/3d/2000_max_min", np.array([fields_max, fields_min]))
-    #     return train_data
+    # Normalize both train and test with training stats
+    field_data_train = (field_data_train - data_mean) / (data_std + 1e-6)
+    field_data_test = (field_data_test - data_mean) / (data_std + 1e-6)
     
-    # else: # testset
-    #     stats = np.load("./Data/3d/2000_max_min.npy")
-    #     fields_max = stats[0]
-    #     fields_min = stats[1]
-    #     field_data_test = (field_data_test - fields_min) / (fields_max - fields_min)
-    #     test_data = Dataset(field_data_test, targets_test, num_test, num_freqs, num_recvers, num_sources)
-
-    #     return test_data
+    # Save normalization stats
+    os.makedirs("./data/3d", exist_ok=True)
+    np.save("./data/3d/2000_mean_std.npy", {'mean': data_mean, 'std': data_std})
+    
+    print(f"Train field data shape: {field_data_train.shape}")  # (N_train, 2, 72, 72)
+    print(f"Test field data shape: {field_data_test.shape}")    # (N_test, 2, 72, 72)
+    
+    # Create Dataset objects
+    train_data = Dataset(field_data_train, targets_train, num_targets_train, num_freqs, num_recvers, num_sources)
+    test_data = Dataset(field_data_test, targets_test, num_test, num_freqs, num_recvers, num_sources)
+    
+    return train_data, test_data
 

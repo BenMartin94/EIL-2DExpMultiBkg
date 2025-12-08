@@ -17,7 +17,7 @@ from data_loader import load_data, FieldsDataset
 from train import LitUNet
 from train_evidential import LitEvidentialUNet
 from train_bcnn import LitBCNNUNet
-from uncertainty_cal_eval import calibration_curve, expected_calibration_error, confidence_interval_coverage, error_std_correlation, wei_ece
+from uncertainty_cal_eval import error_std_correlation, wei_ece, evidential_to_student_t
 
 
 def find_latest_checkpoint(experiment_name):
@@ -293,54 +293,6 @@ def compute_signal_strength(data_loader, device='cpu'):
     return stats
 
 
-def plot_calibration_curve(results_dict, output_path, title='Calibration Curve'):
-    """Plot calibration curves for one or more models."""
-    fig, ax = plt.subplots(figsize=(7, 7))
-    colors = plt.cm.tab10(np.linspace(0, 1, len(results_dict)))
-    
-    for (label, (mean, std, targets)), color in zip(results_dict.items(), colors):
-        expected, observed = calibration_curve(mean, std, targets)
-        ece = expected_calibration_error(mean, std, targets)
-        ax.plot(expected, observed, 'o-', label=f'{label} (ECE={ece:.4f})',
-                linewidth=2, markersize=5, color=color)
-    
-    ax.plot([0, 1], [0, 1], 'k--', linewidth=2, label='Perfect')
-    ax.set_xlabel('Expected Confidence Level', fontsize=13)
-    ax.set_ylabel('Observed Coverage', fontsize=13)
-    ax.set_title(title, fontsize=14)
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=10)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved: {output_path}")
-
-
-def print_metrics(mean, std, targets, label):
-    """Print comprehensive calibration metrics."""
-    print(f"\n{'='*70}\n{label}\n{'='*70}")
-    
-    ece = expected_calibration_error(mean, std, targets)
-    print(f"Expected Calibration Error (ECE): {ece:.4f} (lower is better)")
-    
-    print(f"\nConfidence Interval Coverage:")
-    for conf in [0.68, 0.95, 0.99]:
-        cov, _, _ = confidence_interval_coverage(mean, std, targets, conf)
-        print(f"  {conf*100:.0f}% CI: {cov:.4f} (expected: {conf:.4f})")
-    
-    corr, p_val = error_std_correlation(mean, std, targets)
-    print(f"\nError-Uncertainty Correlation: {corr:.4f} (p={p_val:.4e})")
-    
-    errors = np.abs(mean - targets)
-    print(f"\nPrediction Quality:")
-    print(f"  MAE: {np.mean(errors):.4e}")
-    print(f"  MSE: {np.mean(errors**2):.4e}")
-    print(f"  Mean Uncertainty: {np.mean(std):.4e}")
-    print('='*70)
-
-
 def run_experiment(models, model_types, model_names, test_loader, experiment_name, output_dir, 
                    max_figures=10, device='cuda', noise_std=0):
     """
@@ -384,6 +336,7 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
         all_targets = []
         all_bcnn_preds = []
         all_bcnn_vars = []
+        all_evidential_params = []  # Store (gamma, v, alpha, beta) for evidential models
         
         # Run inference on test data
         with torch.no_grad():
@@ -422,6 +375,8 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
                     gamma, v, alpha, beta = model(x)
                     mean = gamma
                     std = torch.sqrt(beta / (alpha - 1 + 1e-10) + beta / (v * (alpha - 1) + 1e-10))
+                    # Store evidential parameters for Student-t calibration
+                    all_evidential_params.append((gamma.cpu(), v.cpu(), alpha.cpu(), beta.cpu()))
                 
                 all_inputs.append(x.cpu())
                 all_means.append(mean.cpu())
@@ -456,9 +411,23 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
         overall_mse = np.mean((means_np - targets_np)**2)
         mae = np.mean(np.abs(means_np - targets_np))
         correlation, p_value = error_std_correlation(means_np, stds_np, targets_np)
+        
+        # Compute calibration error based on model type
         if model_type == 'bcnn':
             expected_calibration_error_value, creds, accs = wei_ece(bcnn_preds_np, bcnn_stds_np, targets_np)
-
+        elif model_type == 'evidential':
+            # Use Student-t distribution for evidential models
+            gamma_list, v_list, alpha_list, beta_list = zip(*all_evidential_params)
+            gamma_np = torch.cat(gamma_list, dim=0).numpy()
+            v_np = torch.cat(v_list, dim=0).numpy()
+            alpha_np = torch.cat(alpha_list, dim=0).numpy()
+            beta_np = torch.cat(beta_list, dim=0).numpy()
+            
+            # Convert to Student-t parameters
+            mean_t, scale_t, nu_t = evidential_to_student_t(gamma_np, v_np, alpha_np, beta_np)
+            expected_calibration_error_value, creds, accs = wei_ece(
+                mean_t, scale_t, targets_np, distribution='student_t', nu=nu_t
+            )
         else:
             expected_calibration_error_value, creds, accs = wei_ece(means_np, stds_np, targets_np)
         
@@ -489,9 +458,14 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
     num_figs_to_save = min(max_figures, len(all_model_results[0]['inputs']))
     print(f"\n  Saving {num_figs_to_save} combined visualization figures to {exp_output_dir}")
     
+    # Font size configuration for paper-ready plots
+    TITLE_FONTSIZE = 28  # Column titles
+    YLABEL_FONTSIZE = 28  # Model names on left
+    
     for sample_idx in range(num_figs_to_save):
         # Create figure: rows = models, columns = GT, Pred, Std, Abs Error
         fig, axes = plt.subplots(num_models, 4, figsize=(16, 4 * num_models))
+        fig.suptitle(f"{experiment_name} - Sample {sample_idx}", fontsize=32)
         
         # Handle case of single model
         if num_models == 1:
@@ -518,41 +492,56 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
         gt_pred_min = min(torch.min(t).item() for t in all_targets + all_preds)
         gt_pred_max = max(torch.max(t).item() for t in all_targets + all_preds)
         
-        # Compute global min/max for column 2 (Uncertainty)
-        std_min = min(torch.min(s).item() for s in all_stds)
-        std_max = max(torch.max(s).item() for s in all_stds)
-        
         # Compute global min/max for column 3 (Abs Error)
         err_min = min(torch.min(e).item() for e in all_errs)
         err_max = max(torch.max(e).item() for e in all_errs)
         
-        def show(ax, tensor2d, title, cmap='viridis', vmin=None, vmax=None):
+        # Column titles (only displayed on top row)
+        column_titles = ["Ground Truth", "Prediction", "Uncertainty", "Absolute Error"]
+        
+        def show(ax, tensor2d, cmap='viridis', vmin=None, vmax=None, show_ylabel=False, ylabel_text="", show_title=False, title_text=""):
             im = ax.imshow(tensor2d, cmap=cmap, vmin=vmin, vmax=vmax)
-            ax.set_title(title, fontsize=10)
-            ax.axis('off')
+            if show_title:
+                ax.set_title(title_text, fontsize=TITLE_FONTSIZE)
+            if show_ylabel:
+                ax.set_ylabel(ylabel_text, fontsize=YLABEL_FONTSIZE, rotation=90, labelpad=10)
+                ax.set_xticks([])
+                ax.set_yticks([])
+            else:
+                ax.axis('off')
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        
+        # Map model types to display acronyms
+        acronym_map = {'mbkg': 'MBM', 'evidential': 'EDLS', 'bcnn': 'BCNN'}
         
         # Second pass: plot with synced color scales
         for model_idx, model_result in enumerate(all_model_results):
             model_name = model_result['name']
+            model_type = model_types[model_idx]
+            display_name = acronym_map.get(model_type, model_name)
+            is_top_row = (model_idx == 0)
             
-            # Column 0: Ground Truth (synced with Pred)
-            show(axes[model_idx, 0], all_targets[model_idx], f'{model_name}\nGT (Real)', 
-                 cmap='viridis', vmin=gt_pred_min, vmax=gt_pred_max)
+            # Column 0: Ground Truth (synced with Pred) - show ylabel for model name
+            show(axes[model_idx, 0], all_targets[model_idx], 
+                 cmap='viridis', vmin=gt_pred_min, vmax=gt_pred_max,
+                 show_ylabel=True, ylabel_text=display_name,
+                 show_title=is_top_row, title_text=column_titles[0])
             
             # Column 1: Prediction (synced with GT)
-            show(axes[model_idx, 1], all_preds[model_idx], 'Prediction (Real)', 
-                 cmap='viridis', vmin=gt_pred_min, vmax=gt_pred_max)
+            show(axes[model_idx, 1], all_preds[model_idx], 
+                 cmap='viridis', vmin=gt_pred_min, vmax=gt_pred_max,
+                 show_title=is_top_row, title_text=column_titles[1])
             
-            # Column 2: Uncertainty (synced across models)
-            show(axes[model_idx, 2], all_stds[model_idx], 'Uncertainty (Real)', 
-                 cmap='plasma', vmin=std_min, vmax=std_max)
+            # Column 2: Uncertainty (independent scale per model)
+            show(axes[model_idx, 2], all_stds[model_idx], 
+                 cmap='plasma', vmax=1, # clipping for plots.
+                 show_title=is_top_row, title_text=column_titles[2])
             
             # Column 3: Absolute Error (synced across models)
-            show(axes[model_idx, 3], all_errs[model_idx], 'Abs Error (Real)', 
-                 cmap='magma', vmin=err_min, vmax=err_max)
+            show(axes[model_idx, 3], all_errs[model_idx], 
+                 cmap='magma', vmin=err_min, vmax=err_max,
+                 show_title=is_top_row, title_text=column_titles[3])
         
-        plt.suptitle(f'{experiment_name} - Sample {sample_idx}', fontsize=14, y=0.995)
         plt.tight_layout()
         plt.savefig(os.path.join(exp_output_dir, f'sample_{sample_idx:03d}.pdf'), dpi=150, bbox_inches='tight')
         plt.close(fig)
@@ -646,7 +635,7 @@ def main():
     NUM_WORKERS = 2
     SEED = 42
     NUM_SAMPLES = None  # None = use all
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    DEVICE = "cpu"#'cuda' if torch.cuda.is_available() else 'cpu'
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
@@ -770,7 +759,7 @@ def main():
     results_dict = run_experiment(
         models, model_types, EXPERIMENT_NAMES,
         cal_loader,
-        experiment_name="Experiment 7 - Calibrated E-field Test Set with 100% Noise",
+        experiment_name="Experiment 7 - Calibrated E-field Test Set - 100% Noise",
         output_dir="figures",
         max_figures=10,
         device=DEVICE,

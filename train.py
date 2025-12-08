@@ -652,7 +652,7 @@ def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers:
     synth_test_loader = DataLoader(
         synth_test_dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
     )
@@ -671,7 +671,7 @@ def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers:
 def test(
     model: LitUNet,
     test_loader,
-    num_cases: int = 10,
+    num_cases: int = 30,
     output_dir: str = "figures/test",
     device: str | None = None,
     percent_noise_level: float = 0.01,
@@ -749,45 +749,37 @@ def test(
             contrasts_gt_complex = (y_complex - bg_complex) / bg_complex
             contrasts_gt = torch.stack([contrasts_gt_complex.real, contrasts_gt_complex.imag], dim=2)  # (take,nbkgs,2,100,100)
 
-            # Plot 4x1 real-channel contrast (prediction / ground-truth / abs error) for first sample
-
-            sample_idx = collected  # global sample index for this first example in the current batch
-            real_pred = contrasts_pred[0, 0, 0].cpu()  # (100,100)
-            real_gt = contrasts_gt[0, 0, 0].cpu()      # (100,100)
-            real_err = torch.abs(real_pred - real_gt)
-            real_eps_pred = per_bkg_recons[0,0,0].cpu()
-            real_eps_gt = y[0,0].cpu()
-            real_eps_err = torch.abs(real_eps_pred - real_eps_gt)
-
-            fig, axes = plt.subplots(4, 1, figsize=(4, 12))
-            def show(ax, tensor2d, title, cmap='viridis'):
-                im = ax.imshow(tensor2d, cmap=cmap)
-                ax.set_title(title, fontsize=9)
-                ax.axis('off')  # Remove axis ticks and lines
-                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-            show(axes[0], real_pred, 'Pred Contrast (Real)')
-            show(axes[1], real_eps_pred, 'Pred Target (Real)')
-            show(axes[2], real_eps_gt, 'GT Target (Real)')
-            show(axes[3], real_eps_err, 'Abs Error (Real)')
-
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, f"sample_{sample_idx}_contrasts_real.pdf"), dpi=150)
-            plt.close(fig)
-
-
-            #####################################################################
-            # Demonstrate effect of weighted filtering on the reconstructions in a 2x2 plot
-            #####################################################################
-            # Unfiltered
-
-
             mae = torch.mean(torch.abs(mean_recon - y)).item()
             mse = torch.mean((mean_recon - y) ** 2).item()
             print(f"Samples {collected}-{collected+take} MAE={mae:.4e} MSE={mse:.4e}")
 
             for i in range(take):
                 idx_global = collected + i
+                
+                # Plot 2x2 contrast visualization for each sample
+                real_pred = contrasts_pred[i, 0, 0].cpu()  # (100,100)
+                real_gt = contrasts_gt[i, 0, 0].cpu()      # (100,100)
+                real_err = torch.abs(real_pred - real_gt)
+                real_eps_pred = per_bkg_recons[i,0,0].cpu()
+                real_eps_gt = y[i,0].cpu()
+                real_eps_err = torch.abs(real_eps_pred - real_eps_gt)
+
+                fig_contrast, axes_contrast = plt.subplots(2, 2, figsize=(8, 8))
+                def show_contrast(ax, tensor2d, title, cmap='viridis'):
+                    im = ax.imshow(tensor2d, cmap=cmap)
+                    ax.set_title(title, fontsize=28)
+                    ax.axis('off')  # Remove axis ticks and lines
+                    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+                show_contrast(axes_contrast[0, 0], real_pred, 'Pred Contrast')
+                show_contrast(axes_contrast[0, 1], real_eps_pred, 'Pred Target')
+                show_contrast(axes_contrast[1, 0], real_eps_gt, 'GT Target')
+                show_contrast(axes_contrast[1, 1], real_eps_err, 'Abs Error')
+
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f"sample_{idx_global}_contrasts_real.pdf"), dpi=150)
+                plt.close(fig_contrast)
+                
                 # Updated: 2x4 layout (remove first background visualization)
                 fig, axes = plt.subplots(2, 4, figsize=(14, 6))
                 def show(ax, tensor2d, title, cmap='viridis'):
@@ -835,88 +827,6 @@ def test(
     print(f"Saved {collected} test reconstruction figures to {output_dir}")
 
 
-def generate_calibration_curve(model: LitUNet,
-    test_loader,
-    num_cases: int = 100,
-    output_dir: str = "figures/test",
-    device: str | None = None
-    ):
-    from uncertainty_cal_eval import calibration_curve
-    os.makedirs(output_dir, exist_ok=True)
-
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    model.to(device)
-    model.eval()
-
-    nbkgs = getattr(model, 'bkgs', None)
-    if nbkgs is None:
-        raise RuntimeError("Model has no stored backgrounds for calibration curve generation.")
-    nbkgs_count = model.bkgs.shape[0]
-    assert nbkgs_count > 0, "Model has no backgrounds stored for reconstruction."
-
-    means = []
-    stds = []
-    targets = []
-
-    remaining = float('inf') if num_cases is None else max(int(num_cases), 0)
-
-    with torch.no_grad():
-        for batch in test_loader:
-            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-                x, y = batch[:2]
-            else:
-                raise RuntimeError("Expected (x,y) batch from test_loader")
-
-            if remaining <= 0:
-                break
-
-            B = x.shape[0]
-            take = B if remaining == float('inf') else min(B, remaining)
-            x = x.to(device)[:take]
-            y = y.to(device)[:take]
-
-            bg_grid = model.bkgs.unsqueeze(0).expand(take, -1, -1, -1, -1)
-            bg_sct = model.bkg_sct_fields.unsqueeze(0).expand(take, -1, -1, -1, -1)
-            _, mean_recon, std_recon = model.reconstruction(x, bg_sct, bg_grid)
-
-            means.append(mean_recon.cpu().numpy())
-            stds.append(std_recon.cpu().numpy())
-            targets.append(y.cpu().numpy())
-
-            if remaining != float('inf'):
-                remaining -= take
-
-    if not means:
-        raise RuntimeError("No samples were processed for calibration curve generation.")
-    mean_arr = np.concatenate(means, axis=0)
-    std_arr = np.concatenate(stds, axis=0)
-    target_arr = np.concatenate(targets, axis=0)
-
-    print(mean_arr.shape, std_arr.shape, target_arr.shape)
-
-    expected_conf, observed_conf = calibration_curve(mean_arr, std_arr, target_arr)
-
-    fig, ax = plt.subplots(figsize=(5, 5))
-    ax.plot(expected_conf, observed_conf, label='Observed')
-    ax.plot([0, 1], [0, 1], linestyle='--', color='gray', label='Ideal')
-    ax.set_xlabel('Expected confidence')
-    ax.set_ylabel('Observed coverage')
-    ax.set_title('Calibration Curve')
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-
-    output_path = os.path.join(output_dir, 'calibration_curve.pdf')
-    fig.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-
-    print(f"Calibration curve saved to {output_path}")
-
-    return expected_conf, observed_conf
-
 
 def main():
     parser = argparse.ArgumentParser(description="Train UNet to map synth fields (24x24x2) -> grids (100x100x2)")
@@ -932,7 +842,7 @@ def main():
     parser.add_argument("--debug-recon", action="store_true", help="Run a single debug reconstruction before training")
     parser.add_argument("--test-only", action="store_true", help="Skip training and run test on a checkpoint.")
     parser.add_argument("--ckpt-path", type=str, default=None, help="Path to checkpoint for testing. If None, finds latest.")
-    parser.add_argument("--experiment-tag", type=str, default="mbg_train_synth_test_cal_exp_25bkgs_testing_bkg_numbers", help="Tag for experiment (used in logging)")
+    parser.add_argument("--experiment-tag", type=str, default="mbg_train_synth_test_cal_exp_25bkgs", help="Tag for experiment (used in logging)")
     parser.add_argument("--num-backgrounds", type=int, default=25, help="Number of backgrounds to use from training dataset")
     parser.add_argument("--steps-per-epoch", type=int, default=None, help="Number of training steps per epoch. If None, uses full dataset. Data will be reused if this exceeds dataset size.")
 

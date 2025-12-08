@@ -188,50 +188,53 @@ class Fields3DMultiBkgDataset(Dataset):
 	"""
 	3D multi-background dataset tailored for the measurement-to-volume pipeline.
 
-	- fields_np: (N, S, R, 2F) channels-last measurement data
+	- fields_np: (N, 2, S, R) channels-first measurement data where 2 = [real, imag]
 	- targets_np: (N, D, H, W) real-valued volumes
 
 	Returns per pair (foreground x background):
-	  x: (2F, R, S) = fg_sct - bg_sct
-	  y: (1, D, H, W) = (fg_vol - bg_vol)/(bg_vol+eps)
-	  extras: (fg_vol, bg_vol, fg_sct_cf, bg_sct_cf)
+	  x: (2, S, R) = fg_sct - bg_sct
+	  y: (1, D, H, W) = (fg_vol - bg_vol)/(bg_vol+eps) (contrast volume)
+	  extras: (fg_vol, bg_vol, fg_sct, bg_sct)
 	"""
 
 	def __init__(self, fields_np: np.ndarray, targets_np: np.ndarray, n_backgrounds: int, dtype: torch.dtype = torch.float32, seed: int | None = None):
-		assert fields_np.ndim == 4, f"fields must be (N, S, R, 2F), got {fields_np.shape}"
+		assert fields_np.ndim == 4, f"fields must be (N, 2, S, R), got {fields_np.shape}"
 		assert targets_np.ndim == 4, f"targets must be (N, D, H, W), got {targets_np.shape}"
 		assert fields_np.shape[0] == targets_np.shape[0], "Mismatched batch sizes"
+		assert fields_np.shape[1] == 2, f"fields must have 2 channels (real, imag), got {fields_np.shape[1]}"
 		assert 0 < n_backgrounds < fields_np.shape[0], "Invalid n_backgrounds"
 
 		self.dtype = dtype
-		self.fields = fields_np.astype(np.float32, copy=False)
+		self.fields = fields_np.astype(np.float32, copy=False)  # (N, 2, S, R)
 		self.targets = targets_np.astype(np.float32, copy=False)
 
 		if seed is not None:
 			np.random.seed(seed)
 
 		N = self.fields.shape[0]
-		bkg_idx = np.random.choice(N, n_backgrounds, replace=False)
+		# bkg_idx = np.random.choice(N, n_backgrounds, replace=False)
+		bkg_idx = np.arange(N - n_backgrounds, N)  # Take last n_backgrounds indices
 		fg_idx = np.setdiff1d(np.arange(N), bkg_idx)
 
-		self.background_fields = self.fields[bkg_idx]
+		self.background_fields = self.fields[bkg_idx]  # (n_bgs, 2, S, R)
 		self.background_vols = self.targets[bkg_idx]
-		self.foreground_fields = self.fields[fg_idx]
+		self.foreground_fields = self.fields[fg_idx]   # (n_fgs, 2, S, R)
 		self.foreground_vols = self.targets[fg_idx]
 
 		self.n_backgrounds = n_backgrounds
 		self.n_foregrounds = len(fg_idx)
 
 		# Shapes
-		self.S = self.fields.shape[1]
-		self.R = self.fields.shape[2]
-		self.C = self.fields.shape[3]
+		self.C = self.fields.shape[1]  # Should be 2
+		self.S = self.fields.shape[2]  # Sources
+		self.R = self.fields.shape[3]  # Receivers
 		self.D, self.H, self.W = self.targets.shape[1:]
 
 		print("Fields3DMultiBkgDataset initialized:")
 		print(f"  - {self.n_backgrounds} background pairs reserved")
 		print(f"  - {self.n_foregrounds} foreground pairs available")
 		print(f"  - Total dataset size: {len(self)} (each foreground paired with each background)")
+		print(f"  - Field shape per sample: ({self.C}, {self.S}, {self.R})")
 
 	def __len__(self) -> int:
 		return self.n_foregrounds * self.n_backgrounds
@@ -242,30 +245,32 @@ class Fields3DMultiBkgDataset(Dataset):
 		fg_i = idx // self.n_backgrounds
 		bg_i = idx % self.n_backgrounds
 
-		fg_sct = self.foreground_fields[fg_i]  # (S,R,2F)
-		bg_sct = self.background_fields[bg_i]  # (S,R,2F)
-		fg_vol = self.foreground_vols[fg_i]    # (D,H,W)
-		bg_vol = self.background_vols[bg_i]    # (D,H,W)
+		fg_sct = self.foreground_fields[fg_i]  # (2, S, R)
+		bg_sct = self.background_fields[bg_i]  # (2, S, R)
+		fg_vol = self.foreground_vols[fg_i]    # (D, H, W)
+		bg_vol = self.background_vols[bg_i]    # (D, H, W)
 
+		# Compute field: (2, S, R) - (2, S, R) = (2, S, R)
 		x = fg_sct - bg_sct
-		x_cf = np.ascontiguousarray(np.transpose(x, (2, 1, 0)))  # (2F,R,S)
-		x_t = torch.from_numpy(x_cf).to(self.dtype)
+		x_t = torch.from_numpy(np.ascontiguousarray(x)).to(self.dtype)  # (2, S, R)
 
+		# Compute contrast volume
 		eps = 1e-8
 		y = (fg_vol - bg_vol) / (bg_vol + eps)
-		y_t = torch.from_numpy(y[None, ...]).to(self.dtype)  # (1,D,H,W)
+		y_t = torch.from_numpy(y[None, ...]).to(self.dtype)  # (1, D, H, W)
 
-		fg_vol_t = torch.from_numpy(fg_vol[None, ...]).to(self.dtype)
-		bg_vol_t = torch.from_numpy(bg_vol[None, ...]).to(self.dtype)
-		fg_sct_t = torch.from_numpy(x_cf + np.ascontiguousarray(np.transpose(bg_sct, (2, 1, 0)))).to(self.dtype)
-		bg_sct_t = torch.from_numpy(np.ascontiguousarray(np.transpose(bg_sct, (2, 1, 0)))).to(self.dtype)
+		# Convert raw volumes and fields to tensors
+		fg_vol_t = torch.from_numpy(fg_vol[None, ...]).to(self.dtype)  # (1, D, H, W)
+		bg_vol_t = torch.from_numpy(bg_vol[None, ...]).to(self.dtype)  # (1, D, H, W)
+		fg_sct_t = torch.from_numpy(np.ascontiguousarray(fg_sct)).to(self.dtype)  # (2, S, R)
+		bg_sct_t = torch.from_numpy(np.ascontiguousarray(bg_sct)).to(self.dtype)  # (2, S, R)
 
 		return x_t, y_t, fg_vol_t, bg_vol_t, fg_sct_t, bg_sct_t
 
 	def get_backgrounds(self) -> Tuple[torch.Tensor, torch.Tensor]:
-		bg_vols = torch.from_numpy(self.background_vols[:, None, ...]).to(self.dtype)  # (n_bgs,1,D,H,W)
-		bg_sct_cf = np.ascontiguousarray(np.transpose(self.background_fields, (0, 3, 2, 1)))  # (n_bgs,2F,R,S)
-		bg_fields = torch.from_numpy(bg_sct_cf).to(self.dtype)
+		"""Returns background volumes and fields in model-ready format"""
+		bg_vols = torch.from_numpy(self.background_vols[:, None, ...]).to(self.dtype)  # (n_bgs, 1, D, H, W)
+		bg_fields = torch.from_numpy(np.ascontiguousarray(self.background_fields)).to(self.dtype)  # (n_bgs, 2, S, R)
 		return bg_vols, bg_fields
 
 if __name__ == "__main__":
