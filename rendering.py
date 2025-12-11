@@ -8,7 +8,7 @@ def render_volume(
     cmap: str = "coolwarm",
     vmin: float = None,
     vmax: float = None,
-    camera_position: tuple = (-50, 50, 175),
+    camera_position: tuple = (-5, -15, 175),
     focal_point: tuple = None,
     image_size: tuple = (800, 800),
     colormap: str = None,  # Alias for cmap

@@ -407,63 +407,76 @@ def build_3d_loaders(
     return train_loader, val_loader, test_loader
 
 
-def save_orthogonal_slices(target_vol: np.ndarray, pred_vol: np.ndarray, std_vol: np.ndarray, output_path: str):
+def save_slices(target_vol: np.ndarray, pred_vol: np.ndarray, std_vol: np.ndarray, output_path: str):
     """
     Saves a 3x4 grid showing 3 slices along the last axis (W/X).
     Rows: 3 different slice positions along the last axis
-    Columns: GT, Pred, Diff, Std
+    Columns: GT, Pred, Std dev, Abs diff
     """
     import matplotlib.pyplot as plt
 
     # Ensure volumes are 3D
-    target_vol = np.squeeze(target_vol)
-    pred_vol = np.squeeze(pred_vol)
-    std_vol = np.squeeze(std_vol)
-    diff_vol = np.abs(target_vol - pred_vol)
+    gt = np.squeeze(target_vol)
+    pred = np.squeeze(pred_vol)
+    sd = np.squeeze(std_vol)
+    absdiff = np.abs(gt - pred)
 
     # Get dimensions
-    d, h, w = target_vol.shape
+    d, h, w = gt.shape
     
     # Select 3 slice indices along the last axis (W): 1/4, 1/2, 3/4
     slice_indices = [w // 4, w // 2, 3 * w // 4]
 
-    # Create a figure
-    fig, axs = plt.subplots(3, 4, figsize=(16, 12), facecolor='w')
-    fig.suptitle('Slices Along Last Axis (X) of 3D Validation Sample', fontsize=15)
+    # Font size configuration
+    TITLE_FONTSIZE = 20  # Change this to adjust column titles
+    YLABEL_FONTSIZE = 20  # Change this to adjust slice labels
+    SUPTITLE_FONTSIZE = 28  # Change this to adjust the main figure title
+    
+    fig, axes = plt.subplots(3, 4, figsize=(16, 12), facecolor='w')
+    fig.suptitle('3D Reconstruction - Slices', fontsize=SUPTITLE_FONTSIZE)
+    
+    # Column titles (only on top row)
+    column_titles = ["Ground Truth", "Prediction", "Standard Deviation", "|Ground Truth - Prediction|"]
 
     # Plot the data
     for i, w_idx in enumerate(slice_indices):
         # Extract slices along the last axis: [:, :, w_idx]
-        t_slice = target_vol[:, :, w_idx]
-        p_slice = pred_vol[:, :, w_idx]
-        d_slice = diff_vol[:, :, w_idx]
-        s_slice = std_vol[:, :, w_idx]
+        gt_slice = gt[:, :, w_idx]
+        pred_slice = pred[:, :, w_idx]
+        sd_slice = sd[:, :, w_idx]
+        absdiff_slice = absdiff[:, :, w_idx]
         
         # Determine shared color range for target and prediction
-        vmin = min(t_slice.min(), p_slice.min())
-        vmax = max(t_slice.max(), p_slice.max())
+        vmin = min(gt_slice.min(), pred_slice.min())
+        vmax = max(gt_slice.max(), pred_slice.max())
 
-        im0 = axs[i, 0].imshow(t_slice, cmap='viridis', vmin=vmin, vmax=vmax)
-        axs[i, 0].set_title(f"Slice {w_idx}/{w} - GT")
-        axs[i, 0].axis('off')
-        fig.colorbar(im0, ax=axs[i, 0], fraction=0.046, pad=0.04)
+        im0 = axes[i, 0].imshow(gt_slice, cmap='viridis', vmin=vmin, vmax=vmax)
+        if i == 0:  # Only add title to top row
+            axes[i, 0].set_title(column_titles[0], fontsize=TITLE_FONTSIZE)
+        axes[i, 0].set_ylabel(f"Slice {w_idx}/{w}", fontsize=YLABEL_FONTSIZE, rotation=90, labelpad=10)
+        axes[i, 0].set_xticks([])
+        axes[i, 0].set_yticks([])
+        fig.colorbar(im0, ax=axes[i, 0], fraction=0.046, pad=0.04)
 
-        im1 = axs[i, 1].imshow(p_slice, cmap='viridis', vmin=vmin, vmax=vmax)
-        axs[i, 1].set_title(f"Slice {w_idx}/{w} - Pred")
-        axs[i, 1].axis('off')
-        fig.colorbar(im1, ax=axs[i, 1], fraction=0.046, pad=0.04)
+        im1 = axes[i, 1].imshow(pred_slice, cmap='viridis', vmin=vmin, vmax=vmax)
+        if i == 0:  # Only add title to top row
+            axes[i, 1].set_title(column_titles[1], fontsize=TITLE_FONTSIZE)
+        axes[i, 1].axis('off')
+        fig.colorbar(im1, ax=axes[i, 1], fraction=0.046, pad=0.04)
 
-        im_s = axs[i, 2].imshow(s_slice, cmap='plasma')
-        axs[i, 2].set_title(f"Slice {w_idx}/{w} - Std")
-        axs[i, 2].axis('off')
-        fig.colorbar(im_s, ax=axs[i, 2], fraction=0.046, pad=0.04)
+        im2 = axes[i, 2].imshow(sd_slice, cmap='plasma')
+        if i == 0:  # Only add title to top row
+            axes[i, 2].set_title(column_titles[2], fontsize=TITLE_FONTSIZE)
+        axes[i, 2].axis('off')
+        fig.colorbar(im2, ax=axes[i, 2], fraction=0.046, pad=0.04)
 
-        im = axs[i, 3].imshow(d_slice, cmap='magma')
-        axs[i, 3].set_title(f"Slice {w_idx}/{w} - Error")
-        axs[i, 3].axis('off')
-        fig.colorbar(im, ax=axs[i, 3], fraction=0.046, pad=0.04)
+        im3 = axes[i, 3].imshow(absdiff_slice, cmap='magma')
+        if i == 0:  # Only add title to top row
+            axes[i, 3].set_title(column_titles[3], fontsize=TITLE_FONTSIZE)
+        axes[i, 3].axis('off')
+        fig.colorbar(im3, ax=axes[i, 3], fraction=0.046, pad=0.04)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
     print(f"\n--- Slice plot saved to: {output_path} ---")
@@ -611,59 +624,67 @@ def main():
             test_loader=test_loader,
         )
 
-    # --- Save orthogonal slices of one validation example to a PNG file ---
+    # --- Evaluate on Test Set ---
+    print("\n--- Evaluating on Test Set ---")
+    print(f"Model background shapes:")
+    print(f"  bkg_sct_fields: {model.bkg_sct_fields.shape}")
+    print(f"  bkgs: {model.bkgs.shape}")
+    
+    model.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    
+    test_losses = []
+    test_maes = []
+    
     print("\n--- Generating slice plot for visualization ---")
     try:
-        # Get a sample from the validation loader
-        val_batch = next(iter(val_loader))
-        xb, yb, fg_vol_b, bg_vol_b, fg_sct_b, bg_sct_b = val_batch
+        # Get a sample from the test loader
+        test_batch = next(iter(test_loader))
+        x_test_vis, y_test_vis = test_batch
+        x_test_vis = x_test_vis.to(device)
+        B_vis = x_test_vis.shape[0]
 
-        # Ensure model is on the correct device and in eval mode
-        model.eval()
-        device = model.device if hasattr(model, "device") else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-        model.to(device)
-
-        # Run prediction
+        # Run prediction with full reconstruction using backgrounds
         with torch.no_grad():
-            xb = xb.to(device)
-            yp = model(xb)  # (B, D, H, W)
-            _ = yp[0].detach().cpu().numpy()  # contrast prediction (unused here)
-            # reconstruct foreground volume using stored backgrounds
-            # Build tensors for single example reconstruction using all backgrounds
-            fg_sct = fg_sct_b[0:1].to(device)  # (1,2F,R,S)
-            bg_sct = model.bkg_sct_fields.unsqueeze(0).to(device)  # (1,nb,2F,R,S)
-            bg_vol = model.bkgs.unsqueeze(0).to(device)  # (1,nb,1,D,H,W)
-            _, mean_recon, std_recon = model.reconstruction(fg_sct, bg_sct, bg_vol)
-            y_pred = mean_recon[0, 0].detach().cpu().numpy()
-            y_std = std_recon[0, 0].detach().cpu().numpy()
-            y_true = fg_vol_b[0, 0].detach().cpu().numpy()
+            bg_sct_vis = model.bkg_sct_fields.unsqueeze(0).expand(B_vis, -1, -1, -1, -1).to(device)
+            bg_vol_vis = model.bkgs.unsqueeze(0).expand(B_vis, -1, -1, -1, -1, -1).to(device)
+            _, mean_recon_vis, std_recon_vis = model.reconstruction(x_test_vis, bg_sct_vis, bg_vol_vis)
+            
+            y_pred = mean_recon_vis[0, 0].detach().cpu().numpy()
+            y_std = std_recon_vis[0, 0].detach().cpu().numpy()
+        
+        y_true = y_test_vis[0, 0].detach().cpu().numpy()
 
         # Define output directory and save plot
-        out_dir = os.path.join("figures", "remote_view")
-        os.makedirs(out_dir, exist_ok=True)
-        output_path = os.path.join(out_dir, "validation_slices.pdf")
+        test_out_dir = os.path.join("figures", "test_set")
+        os.makedirs(test_out_dir, exist_ok=True)
+        test_output_path = os.path.join(test_out_dir, "test_sample_slices.pdf")
 
-        save_orthogonal_slices(y_true, y_pred, y_std, output_path)
+        save_slices(y_true, y_pred, y_std, test_output_path)
+        print(f"Test slice plot saved to: {test_output_path}")
         
-        # --- Render 3D volumes using vedo ---
-        print("\n--- Rendering 3D volumes ---")
+        # --- Render 3D test volumes using vedo ---
+        print("\n--- Rendering 3D test volumes ---")
         try:
             # Render ground truth
             render_volume(
                 volume=y_true,
-                output_path=os.path.join(out_dir, "validation_gt_render.png"),
+                output_path=os.path.join(test_out_dir, "test_gt_render.png"),
                 focal_point=(np.array(y_true.shape) / 2.0),
                 image_size=(800, 800),
                 colormap="turbo",
                 alpha=[0, 0.1, 0.3, 0.6, 1.0],
                 show_axes=True,
                 background="white",
+                vmin=1.0,
+                vmax=3
             )
             
             # Render prediction
             render_volume(
                 volume=y_pred,
-                output_path=os.path.join(out_dir, "validation_pred_render.png"),
+                output_path=os.path.join(test_out_dir, "test_pred_render.png"),
                 focal_point=(np.array(y_pred.shape) / 2.0),
                 image_size=(800, 800),
                 colormap="turbo",
@@ -671,12 +692,13 @@ def main():
                 show_axes=True,
                 background="white",
                 vmin=1.0,
+                vmax=3
             )
             
             # Render uncertainty (std)
             render_volume(
                 volume=y_std,
-                output_path=os.path.join(out_dir, "validation_std_render.png"),
+                output_path=os.path.join(test_out_dir, "test_std_render.png"),
                 focal_point=(np.array(y_std.shape) / 2.0),
                 image_size=(800, 800),
                 colormap="plasma",
@@ -690,21 +712,20 @@ def main():
             y_diff = np.abs(y_true - y_pred)
             render_volume(
                 volume=y_diff,  
-                output_path=os.path.join(out_dir, "validation_diff_render.png"),
+                output_path=os.path.join(test_out_dir, "test_diff_render.png"),
                 focal_point=(np.array(y_diff.shape) / 2.0),
                 image_size=(800, 800),
                 colormap="magma",
                 alpha=[0, 0.2, 0.4, 0.7, 1.0],
                 show_axes=True,
                 background="white",
-                zoom=1.2
             )
-            print("Volume rendering completed successfully!")
+            print("Test volume rendering completed successfully!")
         except Exception as e:
             print(f"[WARN] Volume rendering failed: {e}")
 
     except StopIteration:
-        print("\n[ERROR] Plotting failed: The validation dataloader is empty.")
+        print("\n[ERROR] Plotting failed: The test dataloader is empty.")
     except Exception as e:
         print(f"\n[ERROR] Plotting failed. An unexpected error occurred: {e}")
 
