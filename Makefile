@@ -116,3 +116,6 @@ test:
 .PHONY: eval
 
 eval: test
+
+save-experiments
+	zip -r experiment_folders.zip figures/experiment_* -x "*.pyc" -x "__pycache__/*"

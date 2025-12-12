@@ -278,15 +278,93 @@ class MultiBkgDataset(Dataset):
         ).to(self.dtype)
         
         return bg_grids_tensor, bg_fields_tensor
-    
 
-if __name__ == "__main__":
+
+class LimitedExampleMultiBkgDataset(MultiBkgDataset):
+    """
+    A subclass of MultiBkgDataset that limits the number of foreground training examples
+    while still using all the backgrounds.
+    
+    For example, with n_examples=1 and n_backgrounds=25, this will:
+    - Select 25 backgrounds
+    - Select only 1 foreground example
+    - Create 25 contrast maps by pairing that 1 foreground with each of the 25 backgrounds
+    
+    This is useful for testing model performance with limited training data.
+    """
+    
+    def __init__(
+        self, 
+        grids: np.ndarray, 
+        fields: np.ndarray, 
+        n_backgrounds: int,
+        n_examples: int,
+        dtype: torch.dtype = torch.float32,
+        seed: Optional[int] = None
+    ):
+        """
+        Initialize the LimitedExampleMultiBkgDataset.
+        
+        Args:
+            grids: Array of shape (N, H, W, 2) containing grid data (real/imag)
+            fields: Array of shape (N, H, W, 2) containing field data (real/imag)
+            n_backgrounds: Number of pairs to reserve as backgrounds
+            n_examples: Number of foreground examples to use (will be paired with all backgrounds)
+            dtype: PyTorch dtype for output tensors
+            seed: Random seed for reproducible background and example selection
+        """
+        assert grids.ndim == 4 and fields.ndim == 4, "Expected (N,H,W,C) arrays"
+        assert grids.shape[0] == fields.shape[0], "Mismatched batch sizes"
+        assert grids.shape[-1] == 2 and fields.shape[-1] == 2, "Expected 2-channel real/imag in last dim"
+        assert n_backgrounds > 0, "Must have at least 1 background"
+        assert n_examples > 0, "Must have at least 1 example"
+        assert n_backgrounds + n_examples <= grids.shape[0], "n_backgrounds + n_examples must be <= total samples"
+        
+        self.dtype = dtype
+        
+        # Set random seed for reproducible selection
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+        
+        total_samples = grids.shape[0]
+        
+        # First, randomly select background indices
+        background_indices = np.random.choice(total_samples, n_backgrounds, replace=False)
+        
+        # Then, select foreground indices from the remaining samples
+        remaining_indices = np.setdiff1d(np.arange(total_samples), background_indices)
+        foreground_indices = np.random.choice(remaining_indices, n_examples, replace=False)
+        
+        # Store backgrounds
+        self.background_grids = grids[background_indices]
+        self.background_fields = fields[background_indices]
+        
+        # Store limited foregrounds
+        self.foreground_grids = grids[foreground_indices]
+        self.foreground_fields = fields[foreground_indices]
+        
+        self.n_backgrounds = n_backgrounds
+        self.n_foregrounds = n_examples  # This is now limited to n_examples
+        
+        print(f"LimitedExampleMultiBkgDataset initialized:")
+        print(f"  - {self.n_backgrounds} background pairs reserved")
+        print(f"  - {self.n_foregrounds} foreground examples (LIMITED)")
+        print(f"  - Total dataset size: {len(self)} (each of {n_examples} foreground(s) paired with each of {n_backgrounds} background(s))")
+        print(f"  - Dataset will contain {n_examples} × {n_backgrounds} = {len(self)} samples")
+
+
+def test_multibkg_dataset():
+    """Test the standard MultiBkgDataset with contrast math verification."""
     import torch
     from torch.utils.data import random_split
     import matplotlib.pyplot as plt
     import numpy as np
     
-    print("Simple test to verify contrast math...")
+    print("\n" + "="*70)
+    print("TESTING MultiBkgDataset")
+    print("="*70)
+    print("\nSimple test to verify contrast math...")
     
     # Load data
     grids, _, cal_e_fields, _ = read_mat_file('all_data.mat')
@@ -514,5 +592,112 @@ if __name__ == "__main__":
             print("  - Cross-subset background inconsistency detected")
     
     print(f"\n{'='*50}")
-    print("✅ Simple test completed!")
-    print(f"{'='*50}")
+    print("✅ MultiBkgDataset test completed!")
+    print(f"{'='*50}\n")
+
+
+def test_limited_example_dataset():
+    """Test the LimitedExampleMultiBkgDataset with few examples and many backgrounds."""
+    import torch
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    print("\n" + "="*70)
+    print("TESTING LimitedExampleMultiBkgDataset")
+    print("="*70)
+    
+    # Load data
+    grids, _, cal_e_fields, _ = read_mat_file('all_data.mat')
+    grids = split_complex_to_real_imag(grids)
+    cal_e_fields = split_complex_to_real_imag(cal_e_fields)
+    
+    # Create dataset with limited examples
+    n_examples = 2
+    n_backgrounds = 10
+    dataset = LimitedExampleMultiBkgDataset(
+        grids=grids, 
+        fields=cal_e_fields, 
+        n_backgrounds=n_backgrounds,
+        n_examples=n_examples,
+        seed=42
+    )
+    
+    print(f"\nDataset created with {n_examples} examples and {n_backgrounds} backgrounds")
+    print(f"Total dataset size: {len(dataset)} (should be {n_examples * n_backgrounds})")
+    assert len(dataset) == n_examples * n_backgrounds, "Dataset size mismatch!"
+    
+    # Verify that we only have n_examples unique foregrounds
+    print(f"\nVerifying that only {n_examples} unique foregrounds are used...")
+    unique_fg_indices = set()
+    for idx in range(len(dataset)):
+        info = dataset.get_indices_info(idx)
+        unique_fg_indices.add(info['fg_idx'])
+    
+    print(f"  Found {len(unique_fg_indices)} unique foreground indices: {sorted(unique_fg_indices)}")
+    assert len(unique_fg_indices) == n_examples, f"Expected {n_examples} unique foregrounds, got {len(unique_fg_indices)}"
+    print(f"  ✅ Correct number of unique foregrounds!")
+    
+    # Verify that all backgrounds are used
+    print(f"\nVerifying that all {n_backgrounds} backgrounds are used...")
+    unique_bg_indices = set()
+    for idx in range(len(dataset)):
+        info = dataset.get_indices_info(idx)
+        unique_bg_indices.add(info['bg_idx'])
+    
+    print(f"  Found {len(unique_bg_indices)} unique background indices: {sorted(unique_bg_indices)}")
+    assert len(unique_bg_indices) == n_backgrounds, f"Expected {n_backgrounds} unique backgrounds, got {len(unique_bg_indices)}"
+    print(f"  ✅ All backgrounds are used!")
+    
+    # Verify contrast math for a few samples
+    print(f"\nVerifying contrast math for sample indices...")
+    test_indices = [0, 5, len(dataset) - 1]  # First, middle, last
+    
+    for idx in test_indices:
+        field, contrast, _, _, _, _ = dataset[idx]
+        original_field, original_grid = dataset.get_original_pair(idx)
+        bg_field, bg_grid = dataset.get_background_pair(idx)
+        
+        # Convert to complex for math
+        contrast_complex = contrast[0] + 1j * contrast[1]
+        bg_complex = bg_grid[0] + 1j * bg_grid[1]
+        original_complex = original_grid[0] + 1j * original_grid[1]
+        
+        # Reconstruct original from contrast and background
+        reconstructed_complex = bg_complex * (contrast_complex + 1)
+        
+        # Check if reconstruction matches original
+        error = np.abs(reconstructed_complex - original_complex).mean()
+        max_error = np.abs(reconstructed_complex - original_complex).max()
+        
+        info = dataset.get_indices_info(idx)
+        status = '✅' if error < 1e-6 else '❌'
+        print(f"  {status} Sample {idx} (fg={info['fg_idx']}, bg={info['bg_idx']}): mean_error={error:.8f}, max_error={max_error:.8f}")
+        assert error < 1e-6, f"Reconstruction error too large for sample {idx}!"
+    
+    print(f"\n✅ All contrast math verifications passed!")
+    
+    # Test that each foreground is paired with all backgrounds
+    print(f"\nVerifying that each foreground is paired with all backgrounds...")
+    for fg_idx in range(n_examples):
+        # Find all dataset indices that use this foreground
+        indices_with_this_fg = [i for i in range(len(dataset)) if dataset.get_indices_info(i)['fg_idx'] == fg_idx]
+        
+        # Get the background indices for these samples
+        bg_indices_for_this_fg = [dataset.get_indices_info(i)['bg_idx'] for i in indices_with_this_fg]
+        
+        print(f"  Foreground {fg_idx} is paired with backgrounds: {sorted(bg_indices_for_this_fg)}")
+        assert len(bg_indices_for_this_fg) == n_backgrounds, f"Foreground {fg_idx} not paired with all backgrounds!"
+        assert len(set(bg_indices_for_this_fg)) == n_backgrounds, f"Foreground {fg_idx} has duplicate background pairings!"
+        assert set(bg_indices_for_this_fg) == set(range(n_backgrounds)), f"Foreground {fg_idx} missing some backgrounds!"
+    
+    print(f"  ✅ Each foreground is correctly paired with all backgrounds!")
+    
+    print(f"\n{'='*50}")
+    print("✅ LimitedExampleMultiBkgDataset test completed!")
+    print(f"{'='*50}\n")
+
+
+if __name__ == "__main__":
+    # Run tests
+    test_multibkg_dataset()
+    test_limited_example_dataset()

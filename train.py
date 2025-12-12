@@ -14,38 +14,12 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 import matplotlib.pyplot as plt
 
-from Unet import UNet
+from Unet import UNet, bayesian_loss
 import main as data_main
-from MultiBkgDataset import MultiBkgDataset
+from MultiBkgDataset import LimitedExampleMultiBkgDataset, MultiBkgDataset
 from Litmus_test import litmus_test
-
-
-class FieldsDataset(Dataset):
-    """
-    Dataset wrapping channels-last numpy arrays.
-    X: (N, 24, 24, 2)
-    Y: (N, 100, 100, 2)
-    Returns tensors in channels-first: X -> (2,24,24), Y -> (2,100,100)
-    """
-
-    def __init__(self, x_np: np.ndarray, y_np: np.ndarray, dtype: torch.dtype = torch.float32):
-        assert x_np.ndim == 4 and y_np.ndim == 4, "Expected (N,H,W) arrays"
-        assert x_np.shape[0] == y_np.shape[0], "Mismatched batch sizes"
-        assert x_np.shape[-1] == 2 and y_np.shape[-1] == 2, "Expected 2-channel real/imag in last dim"
-        self.x = x_np
-        self.y = y_np
-        self.dtype = dtype
-
-    def __len__(self) -> int:
-        return self.x.shape[0]
-
-    def __getitem__(self, idx: int):
-        x = self.x[idx]
-        y = self.y[idx]
-        # (H,W,C) -> (C,H,W)
-        x = torch.from_numpy(np.ascontiguousarray(np.transpose(x, (2, 0, 1)))).to(self.dtype)
-        y = torch.from_numpy(np.ascontiguousarray(np.transpose(y, (2, 0, 1)))).to(self.dtype)
-        return x, y
+from data_loader import load_data, FieldsDataset
+from uncertainty_cal_eval import error_std_correlation
 
 
 class LitUNet(pl.LightningModule):
@@ -63,7 +37,7 @@ class LitUNet(pl.LightningModule):
         # Save hyperparameters, ignoring large tensors.
         self.save_hyperparameters(ignore=['bkgs', 'bkg_sct_fields'])
         self.model = UNet(in_channels=in_channels, out_channels=out_channels, base_channels=base_channels)
-        self.criterion = torch.nn.MSELoss()
+        self.criterion = torch.nn.MSELoss()  # Use this for standard UNet with 2 output channels
         self.experiment_tag = experiment_tag
 
         # Register buffers. They will be populated from the checkpoint if loading.
@@ -193,7 +167,7 @@ class LitUNet(pl.LightningModule):
 
         if nbkgs == 1:
             # If only one background, no need to compute weighted stats
-            return fg_grid, fg_grid[:, 0], torch.zeros_like(fg_grid[:, 0])
+            return fg_grid, fg_grid[:, 0], None
 
         # Unweighted stats (kept for backward compatibility)
         fg_grid_mu = fg_grid.mean(dim=1)  # (B,2,100,100)
@@ -215,6 +189,12 @@ class LitUNet(pl.LightningModule):
         else:
             raise ValueError(f"Unknown filter_method: {filter_method}")
     
+    def enable_dropout(self):
+        """Function to enable the dropout layers during test-time"""
+        for m in self.modules():
+            if m.__class__.__name__.startswith('Dropout'):
+                m.train()
+
     def bkgs_mean_error(self, fg_sct, bg_sct, bg_grid):
         """Using the backgrounds, assess the quality of the contrast prediction around the bkgs return mse across all bkgs
         fg_sct: (B,2,24,24)
@@ -231,7 +211,7 @@ class LitUNet(pl.LightningModule):
         contrast_reshaped = contrast.view(B * nbkgs, 2, H, W)
         pred_epsilon_grid = self.reconstruction(fg_sct, bg_sct, bg_grid)[1]  # (B,2,100,100)
         pred_chi_grid = self(contrast_reshaped)  # (B*nbkgs,2,100,100)
-        pred_chi_grid = pred_chi_grid.view(B, nbkgs, 2, 100, 100)
+        pred_chi_grid = pred_chi_grid.view(B, nbkgs, 4, 100, 100)
 
         pred_epsilon_complex = pred_epsilon_grid[:, 0] + 1j * pred_epsilon_grid[:, 1]
         pred_epsilon_complex = pred_epsilon_complex.unsqueeze(1).expand(-1, nbkgs, -1, -1)  # (B,nbkgs,100,100)
@@ -273,7 +253,7 @@ class LitUNet(pl.LightningModule):
                 self.log("grad_norm", total_norm, on_step=True)
                 
                 # Log model statistics
-                mae = torch.mean(torch.abs(y_hat - y))
+                mae = torch.mean(torch.abs(y_hat[:,:2,:,:] - y))
                 self.log("train_mae", mae, on_step=True)
                 
         return loss
@@ -293,8 +273,8 @@ class LitUNet(pl.LightningModule):
         
         # Additional validation metrics
         with torch.no_grad():
-            mae = torch.mean(torch.abs(y_hat - y))
-            mse = torch.mean((y_hat - y) ** 2)
+            mae = torch.mean(torch.abs(y_hat[:,:2,:,:] - y))
+            mse = torch.mean((y_hat[:,:2,:,:] - y) ** 2)
             self.log("val_mae", mae, on_step=False, on_epoch=True)
             self.log("val_mse", mse, on_step=False, on_epoch=True)
             
@@ -477,12 +457,13 @@ class LitUNet(pl.LightningModule):
                     'reconstruction/mean_reconstruction_real', mean_recon_real_norm, self.current_epoch
                 )
                 
-                # Log standard deviation of reconstructions (real part)
-                std_recon_real = torch.stack([fg_grid_std[i, 0].cpu().unsqueeze(0) for i in range(n_examples)])
-                std_recon_real_norm = normalize_for_tensorboard(std_recon_real)
-                self.logger.experiment.add_images(
-                    'reconstruction/std_reconstruction_real', std_recon_real_norm, self.current_epoch
-                )
+                # Log standard deviation of reconstructions (real part) - only if available
+                if fg_grid_std is not None:
+                    std_recon_real = torch.stack([fg_grid_std[i, 0].cpu().unsqueeze(0) for i in range(n_examples)])
+                    std_recon_real_norm = normalize_for_tensorboard(std_recon_real)
+                    self.logger.experiment.add_images(
+                        'reconstruction/std_reconstruction_real', std_recon_real_norm, self.current_epoch
+                    )
                 
                 # Log individual reconstructions for first background (real part)
                 first_bg_recon_real = torch.stack([fg_grid_reconstructed[i, 0, 0].cpu().unsqueeze(0) for i in range(n_examples)])
@@ -505,12 +486,13 @@ class LitUNet(pl.LightningModule):
                     'reconstruction/mean_reconstruction_imag', mean_recon_imag_norm, self.current_epoch
                 )
                 
-                # Log standard deviation of reconstructions (imaginary part)
-                std_recon_imag = torch.stack([fg_grid_std[i, 1].cpu().unsqueeze(0) for i in range(n_examples)])
-                std_recon_imag_norm = normalize_for_tensorboard(std_recon_imag)
-                self.logger.experiment.add_images(
-                    'reconstruction/std_reconstruction_imag', std_recon_imag_norm, self.current_epoch
-                )
+                # Log standard deviation of reconstructions (imaginary part) - only if available
+                if fg_grid_std is not None:
+                    std_recon_imag = torch.stack([fg_grid_std[i, 1].cpu().unsqueeze(0) for i in range(n_examples)])
+                    std_recon_imag_norm = normalize_for_tensorboard(std_recon_imag)
+                    self.logger.experiment.add_images(
+                        'reconstruction/std_reconstruction_imag', std_recon_imag_norm, self.current_epoch
+                    )
             
             # Create comparison figure showing original vs reconstructed vs mean vs std
             fig, axes = plt.subplots(n_examples, 4, figsize=(16, 4 * n_examples))
@@ -530,9 +512,14 @@ class LitUNet(pl.LightningModule):
                 axes[i, 2].imshow(fg_grid_reconstructed[i, 0, 0].cpu(), cmap="viridis")
                 axes[i, 2].set_title("First BG Recon (real)")
                 
-                # Standard deviation (real part)
-                axes[i, 3].imshow(fg_grid_std[i, 0].cpu(), cmap="plasma")
-                axes[i, 3].set_title("Std Dev (real)")
+                # Standard deviation (real part) - only if available
+                if fg_grid_std is not None:
+                    axes[i, 3].imshow(fg_grid_std[i, 0].cpu(), cmap="plasma")
+                    axes[i, 3].set_title("Std Dev (real)")
+                else:
+                    # If no std available, show a placeholder
+                    axes[i, 3].text(0.5, 0.5, 'N/A', ha='center', va='center', transform=axes[i, 3].transAxes)
+                    axes[i, 3].set_title("Std Dev (N/A)")
                 
                 for j in range(4):
                     axes[i, j].axis("off")
@@ -549,11 +536,14 @@ class LitUNet(pl.LightningModule):
                 # Compute reconstruction error metrics
                 recon_mae = torch.mean(torch.abs(fg_grid_mean - fg_grid))
                 recon_mse = torch.mean((fg_grid_mean - fg_grid) ** 2)
-                recon_mean_std = torch.mean(fg_grid_std)
                 
                 self.log("recon_mae", recon_mae, on_step=False, on_epoch=True)
                 self.log("recon_mse", recon_mse, on_step=False, on_epoch=True)
-                self.log("recon_mean_std", recon_mean_std, on_step=False, on_epoch=True)
+                
+                # Only log std metrics if available (requires multiple backgrounds)
+                if fg_grid_std is not None:
+                    recon_mean_std = torch.mean(fg_grid_std)
+                    self.log("recon_mean_std", recon_mean_std, on_step=False, on_epoch=True)
                 
                 # Log per-channel reconstruction metrics
                 for c in range(fg_grid.shape[1]):
@@ -603,31 +593,39 @@ class LitUNet(pl.LightningModule):
         return optimizer
 
 
-def load_data(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
-    grids, uncal_spars, cal_e_fields, synth_fields = data_main.read_mat_file(file_path)
-    # Convert complex to real/imag last dim
-    grids = data_main.split_complex_to_real_imag(grids)       # (N,100,100,2)
-    synth_fields = data_main.split_complex_to_real_imag(synth_fields)  # (N,24,24,2)
-    cal_e_fields = data_main.split_complex_to_real_imag(cal_e_fields)  # (N,24,24,2)
-    uncal_spars = data_main.split_complex_to_real_imag(uncal_spars)  # (N,24,24,2)
+def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers: int, seed: int, num_backgrounds: int = 25, steps_per_epoch: int = None, num_synthetic_test_samples: int = 25):
+    # Load data with train/test split already done
+    (synth_fields, cal_e_fields, grids, uncal_spars,
+     synth_fields_test, cal_e_fields_test, grids_test, uncal_spars_test) = load_data(
+        file_path, seed=seed, num_synthetic_test_samples=num_synthetic_test_samples
+    )
 
-    # Cast to float32 for training
-    grids = grids.astype(np.float32, copy=False)
-    synth_fields = synth_fields.astype(np.float32, copy=False)
-    cal_e_fields = cal_e_fields.astype(np.float32, copy=False)
-    return synth_fields, cal_e_fields, grids, uncal_spars
+    # cal_e_fields and uncal_spars are only used for testing so there is no need to use their *test* versions, those were only created for clarity and symmetry.
+    print(f"length of synth dataset: {len(synth_fields)}")
 
-
-def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers: int, seed: int, num_backgrounds: int = 25, steps_per_epoch: int = None):
-    synth_fields, cal_e_fields, grids, uncal_spars = load_data(file_path)
     synth_dataset = MultiBkgDataset(fields=synth_fields, grids=grids, n_backgrounds=num_backgrounds)
+    synth_test_dataset = FieldsDataset(x_np=synth_fields_test, y_np=grids_test)
     exp_dataset = FieldsDataset(x_np=cal_e_fields, y_np=grids)
     sparam_dataset = FieldsDataset(x_np=uncal_spars, y_np=grids)
     n_total = len(synth_dataset)
-    n_val = max(1, int(n_total * val_split))
-    n_train = n_total - n_val
-    g = torch.Generator().manual_seed(seed)
-    train_ds, val_ds = random_split(synth_dataset, [n_train, n_val], generator=g)
+    
+    # Handle small datasets: if dataset is too small for a split, use all for training
+    if n_total < 5:
+        print(f"Warning: Dataset size ({n_total}) is very small. Using all data for training, validation will use the same data.")
+        n_train = n_total
+        n_val = n_total
+        g = torch.Generator().manual_seed(seed)
+        train_ds = synth_dataset
+        val_ds = synth_dataset
+    else:
+        n_val = max(1, int(n_total * val_split))
+        n_train = n_total - n_val
+        # Ensure at least 1 sample in training
+        if n_train < 1:
+            n_train = 1
+            n_val = n_total - 1
+        g = torch.Generator().manual_seed(seed)
+        train_ds, val_ds = random_split(synth_dataset, [n_train, n_val], generator=g)
 
     # If steps_per_epoch is specified, create a custom sampler that repeats/limits data
     if steps_per_epoch is not None:
@@ -651,6 +649,13 @@ def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers:
         pin_memory=True,
         generator=test_gen,
     )
+    synth_test_loader = DataLoader(
+        synth_test_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
     sparam_test_loader = DataLoader(
         sparam_dataset,
         batch_size=batch_size,
@@ -660,15 +665,16 @@ def build_loaders(file_path:str, batch_size: int, val_split: float, num_workers:
         generator=sparam_gen,
     )
 
-    return train_loader, val_loader, test_loader, sparam_test_loader
+    return train_loader, val_loader, synth_test_loader,test_loader, sparam_test_loader
 
 
 def test(
     model: LitUNet,
     test_loader,
-    num_cases: int = 10,
+    num_cases: int = 30,
     output_dir: str = "figures/test",
     device: str | None = None,
+    percent_noise_level: float = 0.01,
 ):
     """Run reconstruction on a handful of test samples using backgrounds stored in the model.
 
@@ -678,6 +684,7 @@ def test(
         num_cases: Number of individual samples to visualize.
         output_dir: Directory to save figures.
         device: Optional device override.
+        percent_noise_level: Percentage of signal power to use as noise level when adding noise to inputs. 0.1 for 10%
     """
     os.makedirs(output_dir, exist_ok=True)
     if device is None:
@@ -687,6 +694,12 @@ def test(
     model.eval()
 
     collected = 0
+    
+    # Lists to collect all predictions for correlation analysis
+    all_mean_recons = []
+    all_targets = []
+    all_std_recons = []
+    
     with torch.no_grad():
         for batch in test_loader:
             # FieldsDataset returns (x,y)
@@ -698,14 +711,33 @@ def test(
             take = min(B, num_cases - collected)
             if take <= 0:
                 break
+
             x = x.to(device)[:take]
             y = y.to(device)[:take]
+            
+            
+            # Compute signal power for each sample in the batch
+            signal_power = torch.mean(x ** 2, dim=(1, 2, 3), keepdim=True)  # (take, 1, 1, 1)
+            
+            # Calculate noise standard deviation based on percentage
+            noise_std = torch.sqrt(signal_power * percent_noise_level)
+            
+            # Generate Gaussian noise with the calculated std
+            noise = torch.randn_like(x) * noise_std
+            
+            # Add noise to input
+            x = x + noise
 
             nbkgs = model.bkgs.shape[0]
             assert nbkgs > 0, "Model has no backgrounds stored for reconstruction."
             bg_grid = model.bkgs.unsqueeze(0).expand(take, -1, -1, -1, -1)          # (take,nbkgs,2,100,100)
             bg_sct = model.bkg_sct_fields.unsqueeze(0).expand(take, -1, -1, -1, -1)  # (take,nbkgs,2,24,24)
             per_bkg_recons, mean_recon, std_recon = model.reconstruction(x, bg_sct, bg_grid)
+
+            # Collect for correlation analysis
+            all_mean_recons.append(mean_recon.cpu().numpy())
+            all_targets.append(y.cpu().numpy())
+            all_std_recons.append(std_recon.cpu().numpy())
 
 
             scts = x.unsqueeze(1).expand(-1, nbkgs, -1, -1, -1) - bg_sct  # (take,nbkgs,2,24,24)
@@ -717,45 +749,37 @@ def test(
             contrasts_gt_complex = (y_complex - bg_complex) / bg_complex
             contrasts_gt = torch.stack([contrasts_gt_complex.real, contrasts_gt_complex.imag], dim=2)  # (take,nbkgs,2,100,100)
 
-            # Plot 4x1 real-channel contrast (prediction / ground-truth / abs error) for first sample
-
-            sample_idx = collected  # global sample index for this first example in the current batch
-            real_pred = contrasts_pred[0, 0, 0].cpu()  # (100,100)
-            real_gt = contrasts_gt[0, 0, 0].cpu()      # (100,100)
-            real_err = torch.abs(real_pred - real_gt)
-            real_eps_pred = per_bkg_recons[0,0,0].cpu()
-            real_eps_gt = y[0,0].cpu()
-            real_eps_err = torch.abs(real_eps_pred - real_eps_gt)
-
-            fig, axes = plt.subplots(4, 1, figsize=(4, 12))
-            def show(ax, tensor2d, title, cmap='viridis'):
-                im = ax.imshow(tensor2d, cmap=cmap)
-                ax.set_title(title, fontsize=9)
-                ax.axis('off')  # Remove axis ticks and lines
-                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-            show(axes[0], real_pred, 'Pred Contrast (Real)')
-            show(axes[1], real_eps_pred, 'Pred Target (Real)')
-            show(axes[2], real_eps_gt, 'GT Target (Real)')
-            show(axes[3], real_eps_err, 'Abs Error (Real)')
-
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, f"sample_{sample_idx}_contrasts_real.pdf"), dpi=150)
-            plt.close(fig)
-
-
-            #####################################################################
-            # Demonstrate effect of weighted filtering on the reconstructions in a 2x2 plot
-            #####################################################################
-            # Unfiltered
-
-
             mae = torch.mean(torch.abs(mean_recon - y)).item()
             mse = torch.mean((mean_recon - y) ** 2).item()
             print(f"Samples {collected}-{collected+take} MAE={mae:.4e} MSE={mse:.4e}")
 
             for i in range(take):
                 idx_global = collected + i
+                
+                # Plot 2x2 contrast visualization for each sample
+                real_pred = contrasts_pred[i, 0, 0].cpu()  # (100,100)
+                real_gt = contrasts_gt[i, 0, 0].cpu()      # (100,100)
+                real_err = torch.abs(real_pred - real_gt)
+                real_eps_pred = per_bkg_recons[i,0,0].cpu()
+                real_eps_gt = y[i,0].cpu()
+                real_eps_err = torch.abs(real_eps_pred - real_eps_gt)
+
+                fig_contrast, axes_contrast = plt.subplots(2, 2, figsize=(8, 8))
+                def show_contrast(ax, tensor2d, title, cmap='viridis'):
+                    im = ax.imshow(tensor2d, cmap=cmap)
+                    ax.set_title(title, fontsize=28)
+                    ax.axis('off')  # Remove axis ticks and lines
+                    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+                show_contrast(axes_contrast[0, 0], real_pred, 'Pred Contrast')
+                show_contrast(axes_contrast[0, 1], real_eps_pred, 'Pred Target')
+                show_contrast(axes_contrast[1, 0], real_eps_gt, 'GT Target')
+                show_contrast(axes_contrast[1, 1], real_eps_err, 'Abs Error')
+
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f"sample_{idx_global}_contrasts_real.pdf"), dpi=150)
+                plt.close(fig_contrast)
+                
                 # Updated: 2x4 layout (remove first background visualization)
                 fig, axes = plt.subplots(2, 4, figsize=(14, 6))
                 def show(ax, tensor2d, title, cmap='viridis'):
@@ -779,97 +803,37 @@ def test(
             collected += take
             if collected >= num_cases:
                 break
+    
+    # Compute correlation coefficients
+    all_mean_recons = np.concatenate(all_mean_recons, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+    all_std_recons = np.concatenate(all_std_recons, axis=0)
+    
+    print("\n" + "="*60)
+    print("UNCERTAINTY CORRELATION ANALYSIS")
+    print("="*60)
+    
+    
+    # Compute correlation between prediction error and uncertainty
+    correlation, p_value = error_std_correlation(all_mean_recons, all_std_recons, all_targets)
+    print(f"Uncertainty-Error Correlation: {correlation:.4f} (p={p_value:.4e})")
+    
+    print("="*60)
+    print(f"Interpretation: Values close to +1 indicate good uncertainty estimates.")
+    print(f"High correlation means high uncertainty corresponds to high error.")
+    print("="*60 + "\n")
+    
+    print(f"Saved {collected} test reconstruction figures to {output_dir}")
     print(f"Saved {collected} test reconstruction figures to {output_dir}")
 
-def generate_calibration_curve(model: LitUNet,
-    test_loader,
-    num_cases: int = 100,
-    output_dir: str = "figures/test",
-    device: str | None = None
-    ):
-    from uncertainty_cal_eval import calibration_curve
-    os.makedirs(output_dir, exist_ok=True)
-
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    model.to(device)
-    model.eval()
-
-    nbkgs = getattr(model, 'bkgs', None)
-    if nbkgs is None:
-        raise RuntimeError("Model has no stored backgrounds for calibration curve generation.")
-    nbkgs_count = model.bkgs.shape[0]
-    assert nbkgs_count > 0, "Model has no backgrounds stored for reconstruction."
-
-    means = []
-    stds = []
-    targets = []
-
-    remaining = float('inf') if num_cases is None else max(int(num_cases), 0)
-
-    with torch.no_grad():
-        for batch in test_loader:
-            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-                x, y = batch[:2]
-            else:
-                raise RuntimeError("Expected (x,y) batch from test_loader")
-
-            if remaining <= 0:
-                break
-
-            B = x.shape[0]
-            take = B if remaining == float('inf') else min(B, remaining)
-            x = x.to(device)[:take]
-            y = y.to(device)[:take]
-
-            bg_grid = model.bkgs.unsqueeze(0).expand(take, -1, -1, -1, -1)
-            bg_sct = model.bkg_sct_fields.unsqueeze(0).expand(take, -1, -1, -1, -1)
-            _, mean_recon, std_recon = model.reconstruction(x, bg_sct, bg_grid)
-
-            means.append(mean_recon.cpu().numpy())
-            stds.append(std_recon.cpu().numpy())
-            targets.append(y.cpu().numpy())
-
-            if remaining != float('inf'):
-                remaining -= take
-
-    if not means:
-        raise RuntimeError("No samples were processed for calibration curve generation.")
-    mean_arr = np.concatenate(means, axis=0)
-    std_arr = np.concatenate(stds, axis=0)
-    target_arr = np.concatenate(targets, axis=0)
-
-    print(mean_arr.shape, std_arr.shape, target_arr.shape)
-
-    expected_conf, observed_conf = calibration_curve(mean_arr, std_arr, target_arr)
-
-    fig, ax = plt.subplots(figsize=(5, 5))
-    ax.plot(expected_conf, observed_conf, label='Observed')
-    ax.plot([0, 1], [0, 1], linestyle='--', color='gray', label='Ideal')
-    ax.set_xlabel('Expected confidence')
-    ax.set_ylabel('Observed coverage')
-    ax.set_title('Calibration Curve')
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-
-    output_path = os.path.join(output_dir, 'calibration_curve.pdf')
-    fig.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-
-    print(f"Calibration curve saved to {output_path}")
-
-    return expected_conf, observed_conf
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train UNet to map synth fields (24x24x2) -> grids (100x100x2)")
     parser.add_argument("--data", type=str, default="all_data.mat", help="Path to .mat file")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--base-channels", type=int, default=64)
     parser.add_argument("--val-split", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -887,7 +851,7 @@ def main():
     EXPERIMENT_TAG = args.experiment_tag
     print(f"Steps per epoch: {args.steps_per_epoch}")
 
-    train_loader, val_loader, test_loader, sparam_test_loader = build_loaders(
+    train_loader, val_loader, synth_test_loader, test_loader, sparam_test_loader = build_loaders(
         file_path=args.data,
         batch_size=args.batch_size,
         val_split=args.val_split,
@@ -897,6 +861,7 @@ def main():
         steps_per_epoch=args.steps_per_epoch,
     )
 
+    #args.test_only = True
     if not args.test_only:
         # --- Training Phase ---
         train_base_ds = train_loader.dataset.dataset if hasattr(train_loader.dataset, 'dataset') else train_loader.dataset
@@ -981,7 +946,7 @@ def main():
 
     print(f"Successfully loaded model with {model.bkgs.shape[0]} backgrounds")
     
-    #test(model=model, test_loader=test_loader)
+    test(model=model, test_loader=synth_test_loader)
     # generate_calibration_curve(model=model, test_loader=test_loader, output_dir="figures/test")
     # litmus_test(model=model, in_range_test_loader=test_loader, out_of_range_test_loader=sparam_test_loader)
 
