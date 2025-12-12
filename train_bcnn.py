@@ -14,11 +14,8 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 import matplotlib.pyplot as plt
 
-from Unet import UNetBCNN, bayesian_loss
-import main as data_main
-from MultiBkgDataset import MultiBkgDataset
-from Litmus_test import litmus_test
-from data_loader import load_data, FieldsDataset, AugmentedFieldsDataset
+from src.Unet import UNetBCNN, bayesian_loss
+from src.data_loader import load_data, FieldsDataset, AugmentedFieldsDataset
 
 
 

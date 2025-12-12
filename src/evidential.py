@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from Unet import UNet
+from src.Unet import UNet
 
 
 def evidential_NLL(eps_gt, gamma, v, alpha, beta):

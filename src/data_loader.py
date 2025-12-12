@@ -6,8 +6,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from typing import Tuple
-
-import main as data_main
+import scipy.io as sio
 
 
 class FieldsDataset(Dataset):
@@ -106,13 +105,13 @@ def load_data(file_path: str, seed: int, num_synthetic_test_samples: int = 25) -
         uncal_spars_test: Uncalibrated S-parameters for testing (num_test, 24, 24, 2)
     """
     np.random.seed(seed)
-    grids, uncal_spars, cal_e_fields, synth_fields = data_main.read_mat_file(file_path)
+    grids, uncal_spars, cal_e_fields, synth_fields = read_mat_file(file_path)
     
     # Convert complex to real/imag last dim
-    grids = data_main.split_complex_to_real_imag(grids)       # (N,100,100,2)
-    synth_fields = data_main.split_complex_to_real_imag(synth_fields)  # (N,24,24,2)
-    cal_e_fields = data_main.split_complex_to_real_imag(cal_e_fields)  # (N,24,24,2)
-    uncal_spars = data_main.split_complex_to_real_imag(uncal_spars)  # (N,24,24,2)
+    grids = split_complex_to_real_imag(grids)       # (N,100,100,2)
+    synth_fields = split_complex_to_real_imag(synth_fields)  # (N,24,24,2)
+    cal_e_fields = split_complex_to_real_imag(cal_e_fields)  # (N,24,24,2)
+    uncal_spars = split_complex_to_real_imag(uncal_spars)  # (N,24,24,2)
 
     # Cast to float32 for training
     grids = grids.astype(np.float32, copy=False)
@@ -141,3 +140,36 @@ def load_data(file_path: str, seed: int, num_synthetic_test_samples: int = 25) -
 
     return (synth_fields, cal_e_fields, grids, uncal_spars,
             synth_fields_test, cal_e_fields_test, grids_test, uncal_spars_test)
+
+
+
+
+
+def split_complex_to_real_imag(arr):
+    """
+    Converts an n-dimensional complex array to an (n+1)-dimensional array
+    with the last dimension of size 2: [real, imag].
+    """
+    if not np.iscomplexobj(arr):
+        raise ValueError("Input array must be of complex type.")
+    return np.stack((arr.real, arr.imag), axis=-1)
+
+def read_mat_file(file_path):
+    """Reads a .mat file and returns the contained matrix."""
+    mat_data = sio.loadmat(file_path)
+    num_samples = mat_data['data'].shape[1]
+    grid = mat_data['data'][0, 0][0]
+    uncal_s_par = mat_data['data'][0, 0][1]
+    cal_e_field = mat_data['data'][0, 0][2]
+    synth_field = mat_data['data'][0, 0][3]
+    grids = np.zeros((num_samples, *grid.shape), dtype=np.complex128)
+    uncal_s_pars = np.zeros((num_samples, *uncal_s_par.shape), dtype=np.complex128)
+    cal_e_fields = np.zeros((num_samples, *cal_e_field.shape), dtype=np.complex128)
+    synth_fields = np.zeros((num_samples, *synth_field.shape), dtype=np.complex128)
+    for i in range(num_samples):
+        grids[i] = mat_data['data'][0, i][0]
+        uncal_s_pars[i] = mat_data['data'][0, i][1]
+        cal_e_fields[i] = mat_data['data'][0, i][2]
+        synth_fields[i] = mat_data['data'][0, i][3]
+
+    return grids, uncal_s_pars, cal_e_fields, synth_fields
