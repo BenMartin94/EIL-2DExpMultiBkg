@@ -596,7 +596,7 @@ def run_experiment(models, model_types, model_names, test_loader, experiment_nam
                 label=f"{display_label} (ECE={ece:.4f})")
     
     plt.plot([0, 1], [0, 1], 'k--', linewidth=2, label='Perfect calibration')
-    plt.xlabel('Credibility (Expected)', fontsize=AXIS_LABEL_FONTSIZE)
+    plt.xlabel('Confidence', fontsize=AXIS_LABEL_FONTSIZE)
     plt.ylabel('Accuracy (Observed)', fontsize=AXIS_LABEL_FONTSIZE)
     plt.title(f'Calibration Curves - {experiment_name}', fontsize=TITLE_FONTSIZE)
     plt.legend(fontsize=LEGEND_FONTSIZE)

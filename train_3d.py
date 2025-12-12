@@ -436,7 +436,7 @@ def save_slices(target_vol: np.ndarray, pred_vol: np.ndarray, std_vol: np.ndarra
     fig.suptitle('3D Reconstruction - Slices', fontsize=SUPTITLE_FONTSIZE)
     
     # Column titles (only on top row)
-    column_titles = ["Ground Truth", "Prediction", "Standard Deviation", "|Ground Truth - Prediction|"]
+    column_titles = ["Ground Truth", "Prediction", "Standard Deviation", "Absolute Error"]
 
     # Plot the data
     for i, w_idx in enumerate(slice_indices):
@@ -651,10 +651,10 @@ def main():
             bg_vol_vis = model.bkgs.unsqueeze(0).expand(B_vis, -1, -1, -1, -1, -1).to(device)
             _, mean_recon_vis, std_recon_vis = model.reconstruction(x_test_vis, bg_sct_vis, bg_vol_vis)
             
-            y_pred = mean_recon_vis[0, 0].detach().cpu().numpy()
-            y_std = std_recon_vis[0, 0].detach().cpu().numpy()
+            y_pred = mean_recon_vis[1, 0].detach().cpu().numpy()
+            y_std = std_recon_vis[1, 0].detach().cpu().numpy()
         
-        y_true = y_test_vis[0, 0].detach().cpu().numpy()
+        y_true = y_test_vis[1, 0].detach().cpu().numpy()
 
         # Define output directory and save plot
         test_out_dir = os.path.join("figures", "test_set")
