@@ -13,11 +13,11 @@ import torch
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
-from data_loader import load_data, FieldsDataset
+from src.data_loader import load_data, FieldsDataset
 from train import LitUNet
 from train_evidential import LitEvidentialUNet
 from train_bcnn import LitBCNNUNet
-from uncertainty_cal_eval import error_std_correlation, wei_ece, evidential_to_student_t
+from src.uncertainty_cal_eval import error_std_correlation, wei_ece, evidential_to_student_t
 
 
 def find_latest_checkpoint(experiment_name):
@@ -103,7 +103,7 @@ def build_data_loaders(file_path, batch_size=8, num_workers=2, seed=42, num_synt
     )
     
     # Import MultiBkgDataset for training dataset
-    from MultiBkgDataset import MultiBkgDataset
+    from src.MultiBkgDataset import MultiBkgDataset
     from torch.utils.data import random_split
     
     # Create datasets

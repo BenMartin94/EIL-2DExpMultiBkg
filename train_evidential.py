@@ -18,9 +18,9 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 import matplotlib.pyplot as plt
 
-from evidential import EvidentialUnet, evidential_NLL, reg_loss_1, reg_loss_2
-from data_loader import load_data, FieldsDataset, AugmentedFieldsDataset
-from uncertainty_cal_eval import error_std_correlation
+from src.evidential import EvidentialUnet, evidential_NLL, reg_loss_1, reg_loss_2
+from src.data_loader import load_data, FieldsDataset, AugmentedFieldsDataset
+from src.uncertainty_cal_eval import error_std_correlation
 
 
 class LitEvidentialUNet(pl.LightningModule):

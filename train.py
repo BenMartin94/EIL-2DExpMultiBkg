@@ -14,12 +14,10 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 import matplotlib.pyplot as plt
 
-from Unet import UNet, bayesian_loss
-import main as data_main
-from MultiBkgDataset import LimitedExampleMultiBkgDataset, MultiBkgDataset
-from Litmus_test import litmus_test
-from data_loader import load_data, FieldsDataset
-from uncertainty_cal_eval import error_std_correlation
+from src.Unet import UNet, bayesian_loss
+from src.MultiBkgDataset import LimitedExampleMultiBkgDataset, MultiBkgDataset
+from src.data_loader import load_data, FieldsDataset
+from src.uncertainty_cal_eval import error_std_correlation
 
 
 class LitUNet(pl.LightningModule):

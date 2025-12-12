@@ -6,16 +6,16 @@ from typing import Tuple
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, random_split
-import prepare_data_3d as prep
+import src.prepare_data_3d as prep
 
 # --- New imports for Lightning training and model ---
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from MultiBkgDataset_3d import Fields3DMultiBkgDataset
+from src.MultiBkgDataset_3d import Fields3DMultiBkgDataset
 
-from Models_3d import TransformerUNet
-from rendering import render_volume
+from src.Models_3d import TransformerUNet
+from src.rendering import render_volume
 import matplotlib.pyplot as plt
 
 
