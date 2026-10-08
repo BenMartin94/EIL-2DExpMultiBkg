@@ -176,7 +176,7 @@ The project includes several experimental scenarios:
 
 If you use this code in your research, please cite:
 
-TODO ADD THIS IN
+B. Martin, K. Narendra, H. Janz, C. Gilmore and I. Jeffrey, "Multi-background Data Augmentation for Microwave Imaging Uncertainty Quantification," in IEEE Transactions on Antennas and Propagation, doi: 10.1109/TAP.2026.3737816.
+keywords: {Modeling;Training;Uncertainty;Scattering;Pixel;Deep learning;Measurement;Inverse problems;Microwave imaging;Calibration;Microwave Imaging;Uncertainty Quantification;Deep Learning;Inhomogeneous Backgrounds},
 
-## License
 
